@@ -58,15 +58,14 @@ profile and `mac-screen-sharing.md` for why Command is sent as `Super_L` and Opt
 
 ## Roadmap
 
-1. **Phase 1, RFB client (in progress):** Windows client for Apple's built-in Screen
-   Sharing with the PC-to-Mac keyboard profile.
-2. **Apple security types 33/35/36:** reverse-engineer and implement Apple's encrypted
-   session types so Phase 1 traffic is encrypted (`apple-security-types.md`).
-3. **Phase 2, native host agent:** fluid, low-latency performance via hardware video encoding on
-   the Mac (`phase2-native.md`).
-4. **Linux and macOS clients:** the user wants clients on all three desktops so the
-   experience stays in sync. The keymap and protocol crates are platform-neutral for this
-   reason; each client adds only a shell (window, key capture, rendering) plus a
+1. **RFB client (works today):** Windows client for macOS's built-in Screen Sharing with the
+   PC-to-Mac keyboard profile. The VNC session itself is unencrypted on the wire, so it is
+   intended for trusted LANs; use the native path for transport encryption.
+2. **Native host agent:** smooth, low-latency performance via hardware video encoding on the
+   Mac, with the session encrypted end to end by QUIC/TLS 1.3 (`phase2-native.md`).
+3. **Linux and macOS clients:** clients on all three desktops so the experience stays in
+   sync. The keymap and protocol crates are platform-neutral for this reason; each client adds
+   only a shell (window, key capture, rendering) plus a
    `Key::from_*` table (Linux evdev codes, macOS kVK codes). Notes:
    - Linux: X11 can grab the keyboard; on Wayland, full capture needs the compositor's
      keyboard-shortcuts-inhibit protocol (GNOME/KDE support it) or evdev access.

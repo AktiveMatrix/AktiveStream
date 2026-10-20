@@ -21,7 +21,7 @@ what keeps type 30 on offer.
 
 ## Encodings
 
-Probe: SetEncodings with exactly one encoding, then a non-incremental update of a 64x64 corner.
+Measured by: SetEncodings with exactly one encoding, then a non-incremental update of a 64x64 corner.
 
 | Requested | Server answered with |
 |---|---|
@@ -37,7 +37,7 @@ the Phase 2 native host agent (`phase2-native.md`).
 
 ## Keysym to Mac modifier mapping
 
-Probe: connect with type 30, press one keysym, read `CGEventSource.flagsState(.combinedSessionState)`
+Measured by: connect with type 30, press one keysym, read `CGEventSource.flagsState(.combinedSessionState)`
 over SSH while it is held, release. Modifier keysyms only.
 
 | Keysym | Mac flags while held |
@@ -59,11 +59,11 @@ Consequences:
 - Right Control must be sent as `Control_L`.
 - AktiveStream sends Command as `Super_L`, Option as `Meta_L`, Control as `Control_L`.
 
-The first probe run read `Shift_L` as "nothing"; a re-run with 0.9 s holds and three samples
+The first measurement read `Shift_L` as "nothing"; a re-run with 0.9 s holds and three samples
 showed Shift (left) consistently, so the first reading was a timing artefact. `Control_R`
 stayed "nothing" in every sample.
 
-## Throughput (2026-10-19, unlocked desktop 3456x2234, wired gigabit, ping < 1 ms)
+## Throughput (full desktop 3456x2234, wired gigabit, ping < 1 ms)
 
 Measured with a fresh session per variant, the first full update timed from
 request to last byte.
@@ -124,15 +124,15 @@ Typed through `aktivestream.exe` into a raw-mode Terminal window on the Mac and 
   same session-ownership issue as keystrokes reaching a hidden lock screen. Clipboard works only
   when AktiveStream owns the console (interactive login, no competing remote session). Reliable
   headless clipboard belongs to the native agent, which owns `NSPasteboard` in the user session.
-- Right Shift initially failed: a client-side bug, see `keyboard-profile.md` (Windows quirks).
+- Right Shift needs care on the client side, see `keyboard-profile.md` (Windows quirks).
 
-## Headless (lid closed)
+## Headless Macs
 
-- The Mac runs lid-closed on a shelf. Closing the lid turns the internal display off, which
-  triggered "require password after display off"; screen lock was turned off
-  (`sysadminctl -screenLock off`) on 2026-10-19 so remote sessions are not interrupted.
-- At the lock screen the server reports 1920x1200 instead of 3456x2234.
-- Display modes include 1728x1080 points (3456x2160 pixels), which would show 1:1 in full
-  screen on a 3840x2160 monitor, but switching modes with the lid closed failed
-  (CGError 1014 from an SSH session, `launchctl asuser`, and an Aqua launchd job). Options:
-  a 4K HDMI dummy plug, or a virtual display created by the Phase 2 host agent.
+- A Mac with the lid closed turns its internal display off, which can enable "require password
+  after display off" and interrupt remote sessions; the screen-lock delay can be turned off
+  with `sysadminctl -screenLock off`.
+- At the lock screen the server reports a lower resolution (e.g. 1920x1200) than the logged-in
+  desktop.
+- Switching display modes can fail while the lid is closed (CGError 1014 over SSH /
+  `launchctl asuser`). For a pixel-perfect 1:1 picture, use a 4K HDMI dummy plug or a virtual
+  display from the native host agent.

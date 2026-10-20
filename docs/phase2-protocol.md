@@ -1,7 +1,7 @@
 # Phase 2 protocol (AktiveStream native)
 
 The Phase 2 path replaces VNC with a native Mac agent and a hardware-video transport, for
-fluid, low-latency performance and to run in the user's GUI session (fixing the headless
+smooth, low-latency performance and to run in the user's GUI session (fixing the headless
 clipboard/Zoom gate). Host is Swift; client is the existing Rust app. This file is the wire
 contract both implement.
 

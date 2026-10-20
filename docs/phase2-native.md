@@ -1,9 +1,9 @@
 # Phase 2: native host agent (design notes)
 
-Goal: fluid 60 fps performance (smooth 60 fps at full Retina resolution, tens of
+Goal: smooth 60 fps performance (at at full Retina resolution, tens of
 milliseconds of latency) between this Mac and the AktiveStream clients. Apple's Screen
 Sharing server cannot get there with third-party clients: it only sends lossless ZRLE or
-Zlib encoded on the CPU (`mac-screen-sharing.md`). Fluid's speed comes from a host agent
+Zlib encoded on the CPU (`mac-screen-sharing.md`). That speed comes from a host agent
 that captures the screen and encodes it with the hardware video encoder; AktiveStream needs
 its own.
 
@@ -39,7 +39,7 @@ Status: not started. Nothing here is implemented or measured yet.
   by a renderer trait with a D3D11 implementation).
 - **Linux/macOS clients:** VA-API/NVDEC and VideoToolbox decoders respectively.
 
-## Measured: encode throughput (2026-10-19, `aktivestream-host enctest`, synthetic frames)
+## Measured: encode throughput (`aktivestream-host enctest`, synthetic frames)
 
 M5 Max VideoToolbox HEVC, 1920x1200, release build: **226 fps**, ~76 Mbit/s for a worst-case
 high-entropy moving pattern, single IDR. Apple's lossless VNC does ~4.8 full frames/s at that
@@ -54,5 +54,3 @@ much lower and is the next thing to measure end to end.)
 - End-to-end latency budget: capture, encode, network and decode times per frame on this
   hardware (realtime-paced, not batched).
 - HEVC 4:2:0 text sharpness at Retina size vs. 4:4:4 (VideoToolbox HEVC 4:4:4 support on M5).
-- Whether to reverse-engineer Apple's own high-performance Screen Sharing mode instead
-  (Mac-to-Mac only today; would not need our agent, but no Windows decoder exists for it).
