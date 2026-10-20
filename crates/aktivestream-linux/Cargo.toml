@@ -24,6 +24,9 @@ png = "0.17"
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
 # Opt-in diagnostics for the QUIC/TLS handshake (RUST_LOG=…); quinn/rustls use the log crate.
 env_logger = "0.11"
+# Clipboard sync with the Mac (text only; no image-data feature, so no heavy image dep). Uses the
+# X11 backend on Linux (works under XWayland/WSLg); a native Wayland session needs XWayland.
+arboard = { version = "3", default-features = false }
 # The native QUIC/HEVC path's video decoder. Optional and gated behind the `native` feature:
 # ffmpeg bindings are pinned to the system ffmpeg's major version (ffmpeg-next 9 wants ffmpeg 8)
 # and ffmpeg cannot build on Windows, so the RFB client builds everywhere without it. Build the

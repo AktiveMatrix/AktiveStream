@@ -275,7 +275,9 @@ impl SessionReader {
     }
 }
 
-/// Writing half of a session. `TCP_NODELAY` is set; each call writes one message.
+/// Writing half of a session. `TCP_NODELAY` is set; each call writes one message. Cloneable so
+/// a side channel (e.g. a clipboard poller) can send too; the shared lock keeps messages whole.
+#[derive(Clone)]
 pub struct SessionWriter {
     out: Arc<Mutex<TcpStream>>,
 }

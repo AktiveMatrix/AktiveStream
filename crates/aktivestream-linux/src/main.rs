@@ -35,28 +35,82 @@ use winit::window::{Fullscreen, Window, WindowId};
 struct Shared {
     framebuffer: Mutex<Framebuffer>,
     error: Mutex<Option<String>>,
+    /// The last clipboard text synced in either direction, so neither side echoes it back.
+    last_clip: Mutex<Option<String>>,
 }
 
 impl Shared {
     fn new(width: u32, height: u32) -> Self {
-        Shared { framebuffer: Mutex::new(Framebuffer::new(width, height)), error: Mutex::new(None) }
+        Shared {
+            framebuffer: Mutex::new(Framebuffer::new(width, height)),
+            error: Mutex::new(None),
+            last_clip: Mutex::new(None),
+        }
     }
 }
 
 /// Pulls updates forever, applying each to the shared framebuffer and waking the UI thread. The
 /// reader itself re-requests the next update, so this never touches the writer.
 fn run_reader(shared: Arc<Shared>, proxy: EventLoopProxy<()>, mut reader: SessionReader) {
+    // Clipboard owner for Mac -> Linux pushes; absent if there is no display to serve it.
+    let mut clipboard = arboard::Clipboard::new().ok();
     loop {
         match reader.next_event(&shared.framebuffer) {
             Ok(ServerEvent::Update { .. } | ServerEvent::Resized { .. }) => {
                 let _ = proxy.send_event(());
             }
+            Ok(ServerEvent::CutText(text)) => apply_remote_clipboard(&shared, clipboard.as_mut(), text),
             Ok(_) => {}
             Err(e) => {
                 *shared.error.lock().unwrap() = Some(format!("session: {e}"));
                 let _ = proxy.send_event(());
                 return;
             }
+        }
+    }
+}
+
+/// Mac -> Linux: store the Mac's clipboard text locally, unless it is what we last synced (our own
+/// echo), and remember it so the poller does not send it straight back.
+fn apply_remote_clipboard(shared: &Shared, clipboard: Option<&mut arboard::Clipboard>, text: String) {
+    let Some(clipboard) = clipboard else { return };
+    {
+        let mut last = shared.last_clip.lock().unwrap();
+        if last.as_deref() == Some(text.as_str()) {
+            return;
+        }
+        *last = Some(text.clone());
+    }
+    eprintln!("clipboard <- Mac: {} chars", text.chars().count());
+    let _ = clipboard.set_text(text);
+}
+
+/// Linux -> Mac: the X11 clipboard has no change event, so poll it and forward changes as
+/// ClientCutText. Seeded with the current clipboard so launch-time content is not resent.
+fn run_clipboard_poller(shared: Arc<Shared>, mut writer: SessionWriter) {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("clipboard: disabled ({e})");
+            return;
+        }
+    };
+    if let Ok(text) = clipboard.get_text() {
+        *shared.last_clip.lock().unwrap() = Some(text);
+    }
+    loop {
+        thread::sleep(Duration::from_millis(700));
+        let Ok(text) = clipboard.get_text() else { continue };
+        {
+            let mut last = shared.last_clip.lock().unwrap();
+            if last.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            *last = Some(text.clone());
+        }
+        eprintln!("clipboard -> Mac: {} chars", text.chars().count());
+        if writer.cut_text(&text).is_err() {
+            return; // Session closed.
         }
     }
 }
@@ -594,6 +648,14 @@ fn main() -> Result<(), String> {
     thread::Builder::new()
         .name("rfb-reader".into())
         .spawn(move || run_reader(reader_shared, proxy, reader))
+        .map_err(|e| e.to_string())?;
+
+    // Forward local clipboard changes to the Mac on a side channel (clone shares the write lock).
+    let clip_shared = shared.clone();
+    let clip_writer = writer.clone();
+    thread::Builder::new()
+        .name("clipboard".into())
+        .spawn(move || run_clipboard_poller(clip_shared, clip_writer))
         .map_err(|e| e.to_string())?;
 
     let mut app = App::new(shared, Backend::Rfb { writer, translator: RfbTranslator::new() }, title);
