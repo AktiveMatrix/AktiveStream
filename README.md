@@ -29,7 +29,7 @@ faster — the same approach other hardware-video remote desktops use — so Akt
 | Crate / component | Role |
 |---|---|
 | `aktivestream-win` | Windows client (`aktivestream.exe`): window, Direct3D 11, keyboard hook, VNC + native modes, phone book, SSH tunnel, full-screen toolbar |
-| `aktivestream-linux` | Linux client (X11/Wayland): winit + softbuffer, VNC + native (ffmpeg decode) modes, phone book, SSH tunnel, full-screen toolbar |
+| `aktivestream-desktop` | Desktop client for Linux and macOS: winit + softbuffer, VNC (+ ffmpeg native path on Linux), phone book, SSH tunnel, cursor shapes, full-screen toolbar |
 | `aktivestream-client` | Shared, platform-neutral client logic: the connection phone book and SSH tunnel (so clients stay in parity) |
 | `aktivestream-proto` | Native transport: QUIC/TLS client, trust-on-first-use certificate pinning, wire messages |
 | `aktivestream-video` | Windows HEVC/H.264 decode via Media Foundation (NVDEC) |
@@ -49,18 +49,23 @@ cargo build --release          # produces target/release/aktivestream.exe
 cargo test --workspace
 ```
 
-**Linux client** (Rust). The VNC client needs only the GUI dev packages; the native path is
-behind a `native` feature that pulls ffmpeg (bindings pinned to ffmpeg 8):
+**Desktop client** (Rust, one crate `aktivestream-desktop` for Linux and macOS). The VNC client
+builds on either; the native QUIC + hardware-decode path is behind a `native` feature that pulls
+ffmpeg (Linux only for now, bindings pinned to ffmpeg 8). On macOS the keyboard profile is the
+Mac-native identity layout, selected automatically:
 
 ```sh
-# VNC client (works on any Linux):
+# Linux VNC client (GUI dev packages):
 sudo apt install pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
   libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxcb-shm0-dev
-cargo build -p aktivestream-linux --release                     # target/release/aktivestream
+cargo build -p aktivestream-desktop --release                   # target/release/aktivestream
 
-# Native QUIC + hardware-decode path (needs ffmpeg 8 dev libraries):
+# Linux native QUIC + hardware-decode path (needs ffmpeg 8 dev libraries):
 sudo apt install libva-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
-cargo build -p aktivestream-linux --release --features native
+cargo build -p aktivestream-desktop --release --features native
+
+# macOS VNC client (Rust + Xcode command-line tools):
+cargo build -p aktivestream-desktop --release
 ```
 
 **Mac host agent** (Swift, macOS 14+):

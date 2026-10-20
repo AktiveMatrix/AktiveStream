@@ -1,4 +1,4 @@
-//! AktiveStream Linux client. Milestone 1-2: the RFB path to macOS Screen Sharing in a winit
+//! AktiveStream desktop client (Linux and macOS): the RFB path to macOS Screen Sharing in a winit
 //! window via a softbuffer (CPU) surface, with keyboard and mouse driven through the shared
 //! `aktivestream_keymap` macOS keyboard profile (same behaviour as the Windows client). The native
 //! QUIC + hardware-decode path (for Windows-level performance) is the next milestone; this shell

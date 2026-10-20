@@ -1,6 +1,6 @@
 [package]
-name = "aktivestream-linux"
-description = "AktiveStream Linux client (X11/Wayland)"
+name = "aktivestream-desktop"
+description = "AktiveStream desktop client (Linux and macOS)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

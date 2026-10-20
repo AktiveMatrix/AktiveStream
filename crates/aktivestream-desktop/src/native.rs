@@ -33,7 +33,7 @@ async fn native_snapshot(host: String, password: String, path: String) -> Result
     let socket = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("could not resolve host")?;
 
     let connection = connect(socket, None).await.map_err(|e| e.to_string())?;
-    let control = connection.control("aktivestream-linux", &password).await.map_err(|e| e.to_string())?;
+    let control = connection.control("aktivestream-desktop", &password).await.map_err(|e| e.to_string())?;
     let (info, _send, mut recv) = control.into_parts();
     eprintln!("connected to {} over QUIC", info.name);
 
@@ -136,7 +136,7 @@ async fn native_session_inner(
     let addr = if host.contains(':') { host } else { format!("{host}:{DEFAULT_PORT}") };
     let socket = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("could not resolve host")?;
     let connection = connect(socket, None).await.map_err(|e| e.to_string())?;
-    let control = connection.control("aktivestream-linux", &password).await.map_err(|e| e.to_string())?;
+    let control = connection.control("aktivestream-desktop", &password).await.map_err(|e| e.to_string())?;
     let (info, mut send, mut recv) = control.into_parts();
     eprintln!("connected to {} over QUIC", info.name);
 
@@ -195,7 +195,7 @@ async fn native_input_test_inner(host: String, password: String) -> Result<(), S
     let addr = if host.contains(':') { host } else { format!("{host}:{DEFAULT_PORT}") };
     let socket = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("could not resolve host")?;
     let connection = connect(socket, None).await.map_err(|e| e.to_string())?;
-    let control = connection.control("aktivestream-linux", &password).await.map_err(|e| e.to_string())?;
+    let control = connection.control("aktivestream-desktop", &password).await.map_err(|e| e.to_string())?;
     let (info, mut send, mut recv) = control.into_parts();
     eprintln!("connected to {} over QUIC", info.name);
     tokio::spawn(async move { while matches!(read_message(&mut recv).await, Ok(Some(_))) {} });
@@ -225,7 +225,7 @@ async fn native_bench_inner(host: String, password: String) -> Result<(), String
     let addr = if host.contains(':') { host } else { format!("{host}:{DEFAULT_PORT}") };
     let socket = addr.to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or("could not resolve host")?;
     let connection = connect(socket, None).await.map_err(|e| e.to_string())?;
-    let control = connection.control("aktivestream-linux", &password).await.map_err(|e| e.to_string())?;
+    let control = connection.control("aktivestream-desktop", &password).await.map_err(|e| e.to_string())?;
     let (info, _send, mut recv) = control.into_parts();
     eprintln!("connected to {} over QUIC", info.name);
     ffmpeg::init().map_err(|e| e.to_string())?;
