@@ -1,7 +1,7 @@
 //! Keyboard profile engine for AktiveStream.
 //!
 //! The platform layer reports physical PC keys as [`KeyInput`]. The [`Engine`] applies a
-//! [`Profile`] (by default [`Profile::mac_default`], a sensible PC-to-Mac mapping
+//! [`Profile`] (by default [`Profile::mac_default`], the same layout and conversions as Jump
 //! Desktop's built-in "macOS" profile) and returns [`HostEvent`]s in Mac terms: Command,
 //! Control, Option, Shift and positional keys. Backends turn those into wire events:
 //! [`RfbTranslator`] produces RFB keysyms for macOS Screen Sharing.
@@ -178,7 +178,7 @@ impl HostMod {
     }
 }
 
-/// "When I press `when` + `key`, send `send` + `send_key`", for shortcut remapping.
+/// "When I press `when` + `key`, send `send` + `send_key`", as in Jump's key conversions.
 /// `when` must match the held physical modifiers exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Conversion {
@@ -210,7 +210,7 @@ pub struct LocalShortcut {
 }
 
 /// When Windows system shortcuts (the Win key, Alt+Tab, Alt+Shift+Tab, Alt+Esc, Ctrl+Esc)
-/// go to the host instead of staying on the PC. Routes Windows system shortcuts to the host or keeps them local.
+/// go to the host instead of staying on the PC. Mirrors Jump's "Send Windows Shortcuts".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SystemShortcutMode {
     DontSend,
@@ -219,7 +219,7 @@ pub enum SystemShortcutMode {
     InFullscreen,
 }
 
-/// Mouse rewrites tied to modifiers (Ctrl+click = right click, etc.).
+/// Mouse rewrites tied to modifiers, from Jump's "Mouse & Gestures" tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MouseRules {
     /// Ctrl + left click sends a right click.
@@ -239,15 +239,22 @@ pub struct Profile {
     pub mouse: MouseRules,
     /// Win-key chords that always stay on the PC, even while system shortcuts go to the
     /// host: the Windows Magnifier shortcuts, so magnification keeps working in full screen.
-    /// (Kept on the PC so client-side magnification always works.)
+    /// (A deliberate difference from Jump, which sends these to the Mac.)
     pub windows_chords: Vec<(PhysMods, Key)>,
 }
 
 impl Profile {
-    /// The default PC-to-Mac mapping (see docs/keyboard-profile.md): Left Ctrl = Command, Right Ctrl = Control,
-    /// Alt = Option, Win = Command, plus the default key conversions and client shortcuts.
+    /// the macOS keyboard profile (Left Ctrl = Command, Right Ctrl = Control,
+    /// see docs/keyboard-profile.md):
+    /// Alt = Option, Win = Command, plus its default key conversions and Jump shortcuts.
     pub fn mac_default() -> Profile {
         profile::mac_default()
+    }
+
+    /// Identity profile for the macOS client (a Mac keyboard driving a remote Mac): Command,
+    /// Option and Control pass straight through, with no PC-style key conversions.
+    pub fn mac_native() -> Profile {
+        profile::mac_native()
     }
 }
 

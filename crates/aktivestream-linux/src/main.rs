@@ -32,6 +32,19 @@ use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 
 /// Shared state between the RFB reader thread and the UI thread.
+/// The keyboard profile for this build: the macOS client drives a remote Mac from a Mac keyboard
+/// (identity), every other target drives it from a PC keyboard (the remap profile).
+fn default_profile() -> Profile {
+    #[cfg(target_os = "macos")]
+    {
+        Profile::mac_native()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Profile::mac_default()
+    }
+}
+
 struct Shared {
     framebuffer: Mutex<Framebuffer>,
     error: Mutex<Option<String>>,
@@ -191,7 +204,7 @@ impl App {
             shared,
             backend,
             title,
-            engine: Engine::new(Profile::mac_default()),
+            engine: Engine::new(default_profile()),
             buttons: 0,
             pointer: (0, 0),
             cursor: (0.0, 0.0),
