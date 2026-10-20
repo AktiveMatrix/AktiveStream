@@ -87,7 +87,7 @@ fn handshake(s: &mut TcpStream, version: &[u8; 12], offered: &[u8], user: &str, 
             let client_public = BigUint::from_bytes_be(&rd_vec(s, key_len));
             let key = apple_dh_key(&client_public.modpow(&private, &prime), key_len);
             let cipher = Aes128::new(GenericArray::from_slice(&key));
-            for block in creds.chunks_exact_mut(16) {
+            for block in creds.as_chunks_mut::<16>().0 {
                 cipher.decrypt_block(GenericArray::from_mut_slice(block));
             }
             let field = |f: &[u8]| String::from_utf8(f[..f.iter().position(|&b| b == 0).unwrap()].to_vec()).unwrap();

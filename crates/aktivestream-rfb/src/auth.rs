@@ -73,7 +73,7 @@ pub(crate) fn apple_dh<S: Read + Write>(stream: &mut S, username: &str, password
     creds[64..].copy_from_slice(&credential_field(password)?);
     // The protocol fixes AES-128 in ECB mode over the two credential fields.
     let cipher = Aes128::new(GenericArray::from_slice(&key));
-    for block in creds.chunks_exact_mut(16) {
+    for block in creds.as_chunks_mut::<16>().0 {
         cipher.encrypt_block(GenericArray::from_mut_slice(block));
     }
 
@@ -93,7 +93,7 @@ pub(crate) fn vnc_response(challenge: &[u8; 16], password: &str) -> [u8; 16] {
     }
     let cipher = Des::new(GenericArray::from_slice(&key));
     let mut out = *challenge;
-    for block in out.chunks_exact_mut(8) {
+    for block in out.as_chunks_mut::<8>().0 {
         cipher.encrypt_block(GenericArray::from_mut_slice(block));
     }
     out
