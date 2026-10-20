@@ -83,7 +83,7 @@ pub(crate) fn put_raw(fb: &mut Framebuffer, r: Rect, bytes: &[u8]) -> Option<Rec
     for (row, src) in bytes.chunks_exact(src_stride).take(vis.h as usize).enumerate() {
         let start = (r.y as usize + row) * stride + r.x as usize;
         let dst = &mut fb.pixels[start..start + vw];
-        for (d, s) in dst.iter_mut().zip(src.chunks_exact(4)) {
+        for (d, s) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
             *d = u32::from_le_bytes([s[0], s[1], s[2], 0]);
         }
     }
@@ -206,7 +206,7 @@ fn fill_run(out: &mut [u32], base: usize, stride: usize, tw: usize, pos: &mut us
 
 fn read_palette(b: &mut Bytes<'_>, size: usize, palette: &mut [u32; 128]) -> Result<()> {
     let s = b.take(size * 3)?;
-    for (p, c) in palette.iter_mut().zip(s.chunks_exact(3)) {
+    for (p, c) in palette.iter_mut().zip(s.as_chunks::<3>().0) {
         *p = cpixel(c);
     }
     Ok(())
@@ -229,7 +229,7 @@ pub(crate) fn zrle(data: &[u8], w: usize, h: usize, out: &mut Vec<u32>) -> Resul
                     let s = b.take(tw * th * 3)?;
                     for (row, line) in s.chunks_exact(tw * 3).enumerate() {
                         let start = base + row * w;
-                        for (d, c) in out[start..start + tw].iter_mut().zip(line.chunks_exact(3)) {
+                        for (d, c) in out[start..start + tw].iter_mut().zip(line.as_chunks::<3>().0) {
                             *d = cpixel(c);
                         }
                     }

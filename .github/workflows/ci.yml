@@ -27,9 +27,14 @@ jobs:
         run: cargo build --release -p aktivestream-win
 
   mac-host:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - name: Swift version
+        run: swift --version
       - name: Build host agent
         run: swift build -c release
         working-directory: host

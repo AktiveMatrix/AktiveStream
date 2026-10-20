@@ -79,7 +79,7 @@ impl Shared {
             if fb.width != width || fb.height != height {
                 fb.resize(width, height);
             }
-            for (px, c) in fb.pixels.iter_mut().zip(rgba.chunks_exact(4)) {
+            for (px, c) in fb.pixels.iter_mut().zip(rgba.as_chunks::<4>().0) {
                 *px = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
             }
         }

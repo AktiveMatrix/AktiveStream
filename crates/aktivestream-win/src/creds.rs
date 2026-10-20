@@ -23,7 +23,7 @@ pub fn read(target: &str) -> Option<Login> {
         let c = &*credential;
         let user = if c.UserName.is_null() { String::new() } else { c.UserName.to_string().unwrap_or_default() };
         let blob = std::slice::from_raw_parts(c.CredentialBlob, c.CredentialBlobSize as usize);
-        let wide: Vec<u16> = blob.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
+        let wide: Vec<u16> = blob.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
         let password = String::from_utf16_lossy(&wide);
         CredFree(credential as *const _);
         Some(Login { user, password })
