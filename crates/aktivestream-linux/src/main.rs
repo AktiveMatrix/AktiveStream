@@ -133,6 +133,8 @@ struct App {
     caps: bool,
     fullscreen: bool,
     bar_shown: bool,
+    /// Pixels per wheel notch for the native path (AKTIVESTREAM_SCROLL), as on Windows.
+    scroll_px: f32,
     /// The remote cursor shape currently applied, kept so it can be rescaled on window resize.
     cursor_shape: Option<CursorShape>,
     window: Option<Rc<Window>>,
@@ -196,6 +198,7 @@ impl App {
             caps: false,
             fullscreen: false,
             bar_shown: false,
+            scroll_px: scroll_px_from_env(),
             cursor_shape: None,
             window: None,
             surface: None,
@@ -403,8 +406,9 @@ impl App {
                 }
             }
             Backend::Native { tx, .. } => {
-                // The native host takes pixel scroll deltas; a notch is ~120px (up positive).
-                let _ = tx.send(Input::Scroll { dx: 0.0, dy: notches as f32 * 120.0 });
+                // The native host takes pixel scroll deltas; a notch is `scroll_px` pixels (up
+                // positive), configurable via AKTIVESTREAM_SCROLL like the Windows client.
+                let _ = tx.send(Input::Scroll { dx: 0.0, dy: notches as f32 * self.scroll_px });
             }
         }
     }
@@ -417,6 +421,16 @@ impl App {
             self.send_pointer();
         }
     }
+}
+
+/// Pixels per wheel notch for the native path, from AKTIVESTREAM_SCROLL (default 160), matching the
+/// Windows client so scroll speed is the same across clients.
+fn scroll_px_from_env() -> f32 {
+    std::env::var("AKTIVESTREAM_SCROLL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(160.0)
 }
 
 /// Resamples the remote cursor (`0xAARRGGBB` pixels) by `scale` (window width / framebuffer width,
