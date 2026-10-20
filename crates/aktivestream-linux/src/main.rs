@@ -21,7 +21,7 @@ use std::time::Duration;
 use aktivestream_keymap::native::NativeInput;
 use aktivestream_keymap::{Engine, HostEvent, KeyInput, LocalAction, MouseButton, Profile, RfbTranslator};
 use aktivestream_proto::Input;
-use aktivestream_rfb::{ConnectOptions, Framebuffer, ServerEvent, SessionReader, SessionWriter, connect};
+use aktivestream_rfb::{ConnectOptions, CursorShape, Framebuffer, ServerEvent, SessionReader, SessionWriter, connect};
 use softbuffer::{Context, Surface};
 use tokio::sync::mpsc::UnboundedSender;
 use winit::application::ApplicationHandler;
@@ -37,6 +37,8 @@ struct Shared {
     error: Mutex<Option<String>>,
     /// The last clipboard text synced in either direction, so neither side echoes it back.
     last_clip: Mutex<Option<String>>,
+    /// A newly-received remote cursor shape, picked up and applied by the UI thread.
+    cursor: Mutex<Option<CursorShape>>,
 }
 
 impl Shared {
@@ -45,6 +47,7 @@ impl Shared {
             framebuffer: Mutex::new(Framebuffer::new(width, height)),
             error: Mutex::new(None),
             last_clip: Mutex::new(None),
+            cursor: Mutex::new(None),
         }
     }
 }
@@ -60,6 +63,10 @@ fn run_reader(shared: Arc<Shared>, proxy: EventLoopProxy<()>, mut reader: Sessio
                 let _ = proxy.send_event(());
             }
             Ok(ServerEvent::CutText(text)) => apply_remote_clipboard(&shared, clipboard.as_mut(), text),
+            Ok(ServerEvent::Cursor(shape)) => {
+                *shared.cursor.lock().unwrap() = Some(shape);
+                let _ = proxy.send_event(());
+            }
             Ok(_) => {}
             Err(e) => {
                 *shared.error.lock().unwrap() = Some(format!("session: {e}"));
@@ -126,6 +133,8 @@ struct App {
     caps: bool,
     fullscreen: bool,
     bar_shown: bool,
+    /// The remote cursor shape currently applied, kept so it can be rescaled on window resize.
+    cursor_shape: Option<CursorShape>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -187,8 +196,26 @@ impl App {
             caps: false,
             fullscreen: false,
             bar_shown: false,
+            cursor_shape: None,
             window: None,
             surface: None,
+        }
+    }
+
+    /// Builds and applies the remote cursor at the current framebuffer-to-window scale (the Mac's
+    /// cursor shape, so I-beams, resize arrows and the like match what the Mac shows).
+    fn apply_cursor(&self, event_loop: &ActiveEventLoop) {
+        let (Some(shape), Some(window)) = (&self.cursor_shape, &self.window) else {
+            return;
+        };
+        let dw = f64::from(window.inner_size().width);
+        let sw = f64::from(self.shared.framebuffer.lock().unwrap().width);
+        let scale = if sw > 0.0 { dw / sw } else { 1.0 };
+        let Some((rgba, w, h, hx, hy)) = scaled_cursor_rgba(shape, scale) else {
+            return;
+        };
+        if let Ok(source) = winit::window::CustomCursor::from_rgba(rgba, w, h, hx, hy) {
+            window.set_cursor(event_loop.create_custom_cursor(source));
         }
     }
 
@@ -392,6 +419,33 @@ impl App {
     }
 }
 
+/// Resamples the remote cursor (`0xAARRGGBB` pixels) by `scale` (window width / framebuffer width,
+/// matching the framebuffer blit) to winit RGBA bytes, with the hotspot scaled to match. Returns
+/// `(rgba, width, height, hotspot_x, hotspot_y)`.
+fn scaled_cursor_rgba(shape: &CursorShape, scale: f64) -> Option<(Vec<u8>, u16, u16, u16, u16)> {
+    let (sw, sh) = (shape.width as usize, shape.height as usize);
+    if sw == 0 || sh == 0 || shape.pixels.len() < sw * sh {
+        return None;
+    }
+    let w = ((sw as f64 * scale).round() as usize).max(1);
+    let h = ((sh as f64 * scale).round() as usize).max(1);
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        let sy = (y * sh / h).min(sh - 1);
+        for x in 0..w {
+            let sx = (x * sw / w).min(sw - 1);
+            let px = shape.pixels[sy * sw + sx];
+            rgba.push((px >> 16) as u8); // R
+            rgba.push((px >> 8) as u8); // G
+            rgba.push(px as u8); // B
+            rgba.push((px >> 24) as u8); // A
+        }
+    }
+    let hx = ((f64::from(shape.hotspot_x) * scale).round() as u16).min(w as u16 - 1);
+    let hy = ((f64::from(shape.hotspot_y) * scale).round() as u16).min(h as u16 - 1);
+    Some((rgba, w as u16, h as u16, hx, hy))
+}
+
 impl ApplicationHandler<()> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -425,6 +479,10 @@ impl ApplicationHandler<()> for App {
             event_loop.exit();
             return;
         }
+        if let Some(shape) = self.shared.cursor.lock().unwrap().take() {
+            self.cursor_shape = Some(shape);
+            self.apply_cursor(event_loop);
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -435,6 +493,7 @@ impl ApplicationHandler<()> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) => {
+                self.apply_cursor(event_loop);
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -660,4 +719,33 @@ fn main() -> Result<(), String> {
 
     let mut app = App::new(shared, Backend::Rfb { writer, translator: RfbTranslator::new() }, title);
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn scales_cursor_and_hotspot() {
+        // 2x2 ARGB cursor: opaque red, green, blue, fully transparent.
+        let shape = CursorShape {
+            hotspot_x: 1,
+            hotspot_y: 0,
+            width: 2,
+            height: 2,
+            pixels: vec![0xff_ff_00_00, 0xff_00_ff_00, 0xff_00_00_ff, 0x00_00_00_00],
+        };
+        let (rgba, w, h, hx, hy) = scaled_cursor_rgba(&shape, 2.0).unwrap();
+        assert_eq!((w, h), (4, 4));
+        assert_eq!((hx, hy), (2, 0), "hotspot scales with the image");
+        assert_eq!(rgba.len(), 4 * 4 * 4);
+        assert_eq!(&rgba[0..4], &[255, 0, 0, 255], "top-left stays opaque red (R,G,B,A)");
+        assert_eq!(rgba[rgba.len() - 1], 0, "bottom-right stays transparent");
+    }
+
+    #[test]
+    fn rejects_empty_cursor() {
+        let empty = CursorShape { hotspot_x: 0, hotspot_y: 0, width: 0, height: 0, pixels: vec![] };
+        assert!(scaled_cursor_rgba(&empty, 1.0).is_none());
+    }
 }
