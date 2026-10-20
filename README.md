@@ -28,7 +28,7 @@ faster — the same approach other hardware-video remote desktops use — so Akt
 
 | Crate / component | Role |
 |---|---|
-| `aktivestream-win` | Windows client (`aktivestream.exe`): window, Direct3D 11, keyboard hook, VNC + native modes, connection phone book, SSH tunnel |
+| `aktivestream-win` | Windows client (`aktivestream.exe`): window, Direct3D 11, keyboard hook, VNC + native modes, phone book, SSH tunnel, full-screen toolbar |
 | `aktivestream-linux` | Linux client (X11/Wayland): winit + softbuffer, VNC + native (ffmpeg decode) modes, phone book, SSH tunnel, full-screen toolbar |
 | `aktivestream-client` | Shared, platform-neutral client logic: the connection phone book and SSH tunnel (so clients stay in parity) |
 | `aktivestream-proto` | Native transport: QUIC/TLS client, trust-on-first-use certificate pinning, wire messages |
@@ -90,8 +90,9 @@ aktivestream --tunnel user@jump <mac>    # VNC through an ssh -L forward (off-LA
 Saved connections live in `~/.config/aktivestream/connections` (or `%APPDATA%\aktivestream\connections`
 on Windows): one per line, `name  host  port  mode(rfb|native)  [user]  [tunnel=ssh]`.
 
-On the Linux client in full screen, move the pointer to the top edge for a toolbar (connection
-name, leave full screen, disconnect).
+In full screen, move the pointer to the top edge for a toolbar (connection name, leave full
+screen, disconnect) — on either client; it draws from the shared `aktivestream-client::bar`
+module (Direct3D 11 overlay on Windows, softbuffer on Linux).
 
 ## Interoperability note
 

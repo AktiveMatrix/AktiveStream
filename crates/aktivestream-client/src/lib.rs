@@ -2,5 +2,6 @@
 //! macOS): the connection phone book (`config`) and the SSH tunnel (`tunnel`). Features that are
 //! not tied to a platform live here so all clients stay in parity instead of drifting.
 
+pub mod bar;
 pub mod config;
 pub mod tunnel;

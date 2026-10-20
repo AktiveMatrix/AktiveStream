@@ -15,6 +15,7 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use aktivestream_client::bar;
 use aktivestream_keymap::native::NativeInput;
 use aktivestream_keymap::{
     Disposition, Engine, HostEvent, Key, KeyInput, LocalAction, MouseButton, Profile, RfbTranslator,
@@ -179,6 +180,9 @@ struct App {
     buttons: u8,
     left_sent_as: MouseButton,
     last_pointer: (u16, u16),
+    cursor_px: (i32, i32),
+    bar_shown: bool,
+    bar_force: bool,
     wheel: i32,
     hwheel: i32,
     fullscreen: bool,
@@ -447,10 +451,32 @@ impl App {
         self.cursor.as_ref().map(|c| c.0)
     }
 
+    /// Whether the overlay toolbar should be shown: full screen, with the pointer at the top edge.
+    fn bar_visible(&self) -> bool {
+        (self.fullscreen || self.bar_force)
+            && self.cursor_px.0 >= 0
+            && self.cursor_px.1 >= 0
+            && (self.cursor_px.1 as usize) < bar::BAR_HEIGHT
+    }
+
+    /// Builds the overlay toolbar for the current window width (full width, `BAR_HEIGHT` tall,
+    /// `0x00RRGGBB`), highlighting whichever button the pointer is over. `None` when hidden.
+    fn bar_overlay(&self) -> Option<(Vec<u32>, u32)> {
+        if !self.bar_visible() {
+            return None;
+        }
+        let cw = self.client_size().0.max(1) as usize;
+        let mut buf = vec![0u32; cw * bar::BAR_HEIGHT];
+        let hover = bar::bar_action_at((self.cursor_px.0 as f64, self.cursor_px.1 as f64), cw);
+        bar::draw_bar(&mut buf, cw, bar::BAR_HEIGHT, hover, &self.name);
+        Some((buf, cw as u32))
+    }
+
     /// Uploads `area` (None = everything) and draws one frame with Direct3D. Returns false
     /// when there is no usable renderer, so the caller falls back to GDI.
     fn render(&mut self, area: Option<Rect>, capture: bool) -> bool {
         let started = Instant::now();
+        let overlay = self.bar_overlay();
         let Some(renderer) = self.renderer.as_mut() else { return false };
         let uploaded = {
             let fb = self.shared.framebuffer.lock().unwrap();
@@ -462,6 +488,9 @@ impl App {
             return false;
         }
         renderer.draw(self.view);
+        if let Some((buf, w)) = &overlay {
+            renderer.draw_bar(buf, *w, bar::BAR_HEIGHT as u32);
+        }
         if capture && let Some(path) = &self.screenshot {
             match renderer
                 .capture()
@@ -519,6 +548,36 @@ impl App {
             // Wheel messages carry screen coordinates.
             unsafe {
                 let _ = ScreenToClient(self.hwnd, &mut point);
+            }
+        }
+        self.cursor_px = (point.x, point.y);
+        if self.fullscreen {
+            let over = point.x >= 0 && point.y >= 0 && (point.y as usize) < bar::BAR_HEIGHT;
+            if over || self.bar_shown {
+                // Repaint the top strip so the toolbar reveals, updates its hover, or clears.
+                let strip =
+                    RECT { left: 0, top: 0, right: self.client_size().0.max(1), bottom: bar::BAR_HEIGHT as i32 };
+                unsafe {
+                    let _ = InvalidateRect(Some(self.hwnd), Some(&strip), false);
+                }
+            }
+            self.bar_shown = over;
+            if over {
+                if message == WM_LBUTTONDOWN {
+                    let cw = self.client_size().0.max(1) as usize;
+                    let code = match bar::bar_action_at((point.x as f64, point.y as f64), cw) {
+                        Some(bar::BarAction::Windowed) => Some(LOCAL_FULLSCREEN),
+                        Some(bar::BarAction::Disconnect) => Some(LOCAL_DISCONNECT),
+                        None => None,
+                    };
+                    if let Some(code) = code {
+                        unsafe {
+                            let _ = PostMessageW(Some(self.hwnd), WM_APP_LOCAL, WPARAM(code), LPARAM(0));
+                        }
+                    }
+                }
+                // Swallow all pointer input over the toolbar so it never reaches the Mac.
+                return;
             }
         }
         let (x, y) = self.view.fb_point(point.x, point.y);
@@ -749,6 +808,40 @@ fn paint_gdi(hwnd: HWND, ps: &PAINTSTRUCT, hdc: windows::Win32::Graphics::Gdi::H
             }
         }
     }
+    // Overlay toolbar (full screen only), composited 1:1 over the top of the framebuffer blit.
+    if let Some((buf, bw)) = with_app(|app| app.bar_overlay()).flatten() {
+        let bh = bar::BAR_HEIGHT as i32;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: bw as i32,
+                biHeight: -bh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            SetStretchBltMode(hdc, COLORONCOLOR);
+            StretchDIBits(
+                hdc,
+                0,
+                0,
+                bw as i32,
+                bh,
+                0,
+                0,
+                bw as i32,
+                bh,
+                Some(buf.as_ptr().cast()),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    }
     with_app(|app| {
         app.paints += 1;
         app.paint_time += started.elapsed();
@@ -834,7 +927,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == TIMER_EXIT => {
-            let captured = with_app(|app| app.screenshot.is_some() && app.render(None, true)).unwrap_or(false);
+            let captured = with_app(|app| {
+                if app.screenshot.is_none() {
+                    return false;
+                }
+                if app.bar_force {
+                    // Diagnostic (AKTIVE_BAR_SHOT): force the toolbar on and hover the leave-full-screen
+                    // button so the capture exercises the Direct3D overlay path end to end.
+                    let cw = app.client_size().0.max(1);
+                    app.cursor_px = (cw - bar::BAR_HEIGHT as i32 * 2 + 4, 6);
+                }
+                app.render(None, true)
+            })
+            .unwrap_or(false);
             if !captured && let Some(Some(path)) = with_app(|app| app.screenshot.clone()) {
                 match diag::capture_client(hwnd, &path) {
                     Ok(()) => println!("screenshot: {}", path.display()),
@@ -993,6 +1098,9 @@ pub fn run_window(
         buttons: 0,
         left_sent_as: MouseButton::Left,
         last_pointer: (0, 0),
+        cursor_px: (0, 0),
+        bar_shown: false,
+        bar_force: std::env::var_os("AKTIVE_BAR_SHOT").is_some(),
         wheel: 0,
         hwheel: 0,
         fullscreen: false,

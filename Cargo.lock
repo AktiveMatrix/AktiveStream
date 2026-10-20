@@ -60,6 +60,9 @@ dependencies = [
 [[package]]
 name = "aktivestream-client"
 version = "0.1.0"
+dependencies = [
+ "font8x8",
+]
 
 [[package]]
 name = "aktivestream-keymap"
@@ -78,7 +81,6 @@ dependencies = [
  "aktivestream-rfb",
  "env_logger",
  "ffmpeg-next",
- "font8x8",
  "png",
  "softbuffer",
  "tokio",

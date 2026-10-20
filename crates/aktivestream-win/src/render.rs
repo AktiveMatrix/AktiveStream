@@ -75,6 +75,7 @@ pub struct Renderer {
     swap_chain: IDXGISwapChain1,
     target: Option<ID3D11RenderTargetView>,
     texture: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
+    bar_texture: Option<(ID3D11Texture2D, ID3D11ShaderResourceView, u32, u32)>,
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
     constants: ID3D11Buffer,
@@ -173,6 +174,7 @@ impl Renderer {
                 swap_chain,
                 target: None,
                 texture: None,
+                bar_texture: None,
                 vertex_shader: vertex_shader.expect("vertex shader"),
                 pixel_shader: pixel_shader.expect("pixel shader"),
                 constants: constants.expect("constant buffer"),
@@ -280,6 +282,63 @@ impl Renderer {
                 TopLeftY: view.y as f32,
                 Width: view.w as f32,
                 Height: view.h as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            }]));
+            self.context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            self.context.IASetInputLayout(None);
+            self.context.VSSetShader(&self.vertex_shader, None);
+            self.context.PSSetShader(&self.pixel_shader, None);
+            self.context.PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
+            self.context.PSSetShaderResources(0, Some(&[Some(srv.clone())]));
+            self.context.Draw(3, 0);
+        }
+    }
+
+    /// Composites the overlay toolbar (`pixels`, a `w`x`h` buffer of `0x00RRGGBB`) 1:1 at the
+    /// top-left of the window, over whatever `draw` left in the back buffer. Reuses the area
+    /// shader at unit scale so the toolbar is pixel-exact, never scaled with the framebuffer.
+    pub fn draw_bar(&mut self, pixels: &[u32], w: u32, h: u32) {
+        if w == 0 || h == 0 || pixels.len() < (w as usize) * (h as usize) {
+            return;
+        }
+        let Some(target) = self.target.clone() else { return };
+        let fresh = !matches!(&self.bar_texture, Some((_, _, bw, bh)) if (*bw, *bh) == (w, h));
+        unsafe {
+            if fresh {
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: w,
+                    Height: h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                    ..Default::default()
+                };
+                let mut texture = None;
+                if self.device.CreateTexture2D(&desc, None, Some(&mut texture)).is_err() {
+                    return;
+                }
+                let texture = texture.expect("overlay texture");
+                let mut view = None;
+                if self.device.CreateShaderResourceView(&texture, None, Some(&mut view)).is_err() {
+                    return;
+                }
+                self.bar_texture = Some((texture, view.expect("overlay shader resource view"), w, h));
+            }
+            let Some((texture, srv, ..)) = &self.bar_texture else { return };
+            self.context.UpdateSubresource(texture, 0, None, pixels.as_ptr().cast(), w * 4, 0);
+            let constants =
+                Constants { origin: [0.0, 0.0], scale: [1.0, 1.0], src_size: [w as i32, h as i32], pad: [0, 0] };
+            self.context.UpdateSubresource(&self.constants, 0, None, (&raw const constants).cast(), 0, 0);
+            self.context.OMSetRenderTargets(Some(&[Some(target)]), None);
+            self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: w as f32,
+                Height: h as f32,
                 MinDepth: 0.0,
                 MaxDepth: 1.0,
             }]));
