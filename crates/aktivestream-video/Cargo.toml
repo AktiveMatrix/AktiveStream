@@ -1,0 +1,25 @@
+[package]
+name = "aktivestream-video"
+description = "Windows HEVC/H.264 decode via Media Foundation (NVDEC) for the AktiveStream client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dependencies.windows]
+version = "0.61"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+]
+
+[dev-dependencies]
+png = "0.17"
+aktivestream-proto = { path = "../aktivestream-proto" }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros"] }

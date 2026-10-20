@@ -1,0 +1,3 @@
+# Built on Windows, macOS and Linux: keep LF in the repository and working trees.
+* text=auto eol=lf
+*.png binary

@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/aktivestream-rfb", "crates/aktivestream-keymap", "crates/aktivestream-proto", "crates/aktivestream-video", "crates/aktivestream-win"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+aktivestream-rfb = { path = "crates/aktivestream-rfb" }
+aktivestream-keymap = { path = "crates/aktivestream-keymap" }
+bitflags = "2"
+thiserror = "2"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
+
+# Decoders are hot even in debug runs; keep them usable without --release.
+[profile.dev.package.aktivestream-rfb]
+opt-level = 2
+[profile.dev.package.miniz_oxide]
+opt-level = 3

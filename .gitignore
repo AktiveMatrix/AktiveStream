@@ -1,0 +1,21 @@
+/target/
+**/*.rs.bk
+
+# Swift host build output
+/host/.build/
+
+# Local outputs and captures
+/artifacts/
+*.log
+*.pcap
+
+# Secrets and local config
+*.local.toml
+.env
+.env.*
+*.p12
+*.keychain-db
+
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,10 @@
+[package]
+name = "aktivestream-keymap"
+description = "Keyboard profile engine: PC keys to Mac host events, a configurable PC-to-Mac mapping"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+bitflags.workspace = true

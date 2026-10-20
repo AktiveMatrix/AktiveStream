@@ -1,0 +1,24 @@
+[package]
+name = "aktivestream-rfb"
+description = "RFB client for macOS Screen Sharing: Apple DH auth, ZRLE/Zlib, cursor and resize pseudo-encodings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# zlib streams for ZRLE and Zlib encodings. zlib-rs (pure Rust port of zlib-ng) inflates
+# a full Retina frame several times faster than the default miniz_oxide backend.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# Apple DH auth (security type 30): AES-128-ECB over MD5 of the DH secret, modpow on the server prime.
+aes = "0.8"
+md-5 = "0.10"
+num-bigint = "0.4"
+# Classic VNC auth (security type 2) uses single DES.
+des = "0.8"
+getrandom = "0.3"
+
+[dev-dependencies]
+# Saves the first frame in examples/smoke.rs.
+png = "0.17"

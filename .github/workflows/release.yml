@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows-client:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p aktivestream-win
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item target/release/aktivestream.exe dist/
+          Compress-Archive -Path dist/* -DestinationPath aktivestream-windows-x64.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: aktivestream-windows-x64.zip
+
+  mac-host:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build host agent
+        run: swift build -c release
+        working-directory: host
+      - name: Package (unsigned)
+        run: |
+          mkdir -p dist
+          cp .build/release/aktivestream-host dist/
+          tar -C dist -czf "$GITHUB_WORKSPACE/aktivestream-host-macos-arm64.tar.gz" aktivestream-host
+        working-directory: host
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: aktivestream-host-macos-arm64.tar.gz
