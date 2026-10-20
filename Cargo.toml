@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/aktivestream-rfb", "crates/aktivestream-keymap", "crates/aktivestream-proto", "crates/aktivestream-video", "crates/aktivestream-win"]
+members = ["crates/aktivestream-rfb", "crates/aktivestream-keymap", "crates/aktivestream-proto", "crates/aktivestream-video", "crates/aktivestream-win", "crates/aktivestream-linux"]
 
 [workspace.package]
 version = "0.1.0"

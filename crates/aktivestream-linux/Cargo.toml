@@ -1,0 +1,32 @@
+[package]
+name = "aktivestream-linux"
+description = "AktiveStream Linux client (X11/Wayland)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "aktivestream"
+path = "src/main.rs"
+
+[dependencies]
+aktivestream-rfb.workspace = true
+aktivestream-keymap.workspace = true
+aktivestream-proto = { path = "../aktivestream-proto" }
+# Cross-platform windowing (X11 + Wayland) and a CPU framebuffer surface.
+winit = "0.30"
+softbuffer = "0.4"
+# Headless snapshot mode (AKTIVE_SNAPSHOT) writes a decoded frame to a PNG, for verifying the
+# pipeline without a display server or screenshot tool.
+png = "0.17"
+# Public-domain 8x8 bitmap font for the overlay toolbar text (connection name); pure data.
+font8x8 = "0.3"
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
+# Opt-in diagnostics for the QUIC/TLS handshake (RUST_LOG=…); quinn/rustls use the log crate.
+env_logger = "0.11"
+
+# The native QUIC/HEVC path needs a Linux video decoder (ffmpeg, VA-API-capable). ffmpeg can't
+# build on Windows, so it is Linux-only; the RFB path above stays cross-platform.
+[target.'cfg(target_os = "linux")'.dependencies]
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }

@@ -64,6 +64,11 @@ func loadOrCreateIdentity() throws -> HostIdentity {
     else {
         throw IdentityError.importFailed(status)
     }
+    // Only after the import: stop the keychain auto-locking, and keep re-unlocking it so that a
+    // sleep/wake which locks it anyway recovers within seconds rather than breaking every TLS
+    // handshake until the agent is restarted.
+    disableAutoLock(keychain, password: passphrase)
+    keepUnlocked(keychain, password: passphrase)
     return hostIdentity(from: identityAny as! SecIdentity)
 }
 
@@ -88,6 +93,31 @@ private func openKeychain(at url: URL, password: String) throws -> SecKeychain {
     let status = SecKeychainCreate(path, UInt32(pw.count), pw, false, nil, &keychain)
     guard status == errSecSuccess, let keychain else { throw IdentityError.importFailed(status) }
     return keychain
+}
+
+/// Keep the TLS private key usable for the life of the agent: a keychain that locks on sleep or
+/// after an idle interval would start failing the TLS handshake on a long-running agent (the
+/// server can no longer sign), which looks like a client-side `crypto TLS error`.
+private func disableAutoLock(_ keychain: SecKeychain, password: String) {
+    var settings = SecKeychainSettings(
+        version: 1, lockOnSleep: false, useLockInterval: false, lockInterval: UInt32.max)
+    SecKeychainSetSettings(keychain, &settings)
+    // SecKeychainSetSettings can leave the keychain locked; re-unlock so the TLS key stays usable.
+    let pw = Array(password.utf8)
+    SecKeychainUnlock(keychain, UInt32(pw.count), pw, true)
+}
+
+/// Re-unlocks the keychain every few seconds with the known passphrase (no prompt), so a lock
+/// from sleep/wake self-heals and the agent keeps serving TLS without a manual restart.
+private func keepUnlocked(_ keychain: SecKeychain, password: String) {
+    let box = SendableBox(value: keychain)
+    Thread.detachNewThread {
+        let pw = Array(password.utf8)
+        while true {
+            Thread.sleep(forTimeInterval: 10)
+            SecKeychainUnlock(box.value, UInt32(pw.count), pw, true)
+        }
+    }
 }
 
 
