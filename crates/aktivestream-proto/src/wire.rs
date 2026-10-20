@@ -17,6 +17,9 @@ pub mod kind {
     pub const TEST_FRAME: u8 = 20;
     pub const VIDEO_FRAME: u8 = 21;
     pub const VIDEO_START: u8 = 22;
+    pub const INPUT_KEY: u8 = 30;
+    pub const INPUT_POINTER: u8 = 31;
+    pub const INPUT_SCROLL: u8 = 32;
 }
 
 /// Largest single control/frame message accepted (a raw test frame can be a few MB).
@@ -98,6 +101,10 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    pub fn f32(&mut self) -> Result<f32> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
     /// A `u8`-length-prefixed UTF-8 string.
     pub fn short_string(&mut self) -> Result<String> {
         let n = self.u8()? as usize;
@@ -133,6 +140,11 @@ impl Writer {
     }
 
     pub fn u32(&mut self, v: u32) -> &mut Self {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+        self
+    }
+
+    pub fn f32(&mut self, v: f32) -> &mut Self {
         self.buf.extend_from_slice(&v.to_le_bytes());
         self
     }

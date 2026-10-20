@@ -189,6 +189,40 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
 }
 
+/// Client -> host input (native path). Pointer coordinates are 0..1 of the streamed display.
+#[derive(Debug, Clone, Copy)]
+pub enum Input {
+    Key { keycode: u16, down: bool, flags: u32 },
+    Pointer { buttons: u8, x: f32, y: f32 },
+    Scroll { dx: f32, dy: f32 },
+}
+
+impl Input {
+    fn encode(&self) -> (u8, Vec<u8>) {
+        let mut w = Writer::new();
+        match *self {
+            Input::Key { keycode, down, flags } => {
+                w.u16(keycode).u8(down as u8).u32(flags);
+                (kind::INPUT_KEY, w.finish().to_vec())
+            }
+            Input::Pointer { buttons, x, y } => {
+                w.u8(buttons).f32(x).f32(y);
+                (kind::INPUT_POINTER, w.finish().to_vec())
+            }
+            Input::Scroll { dx, dy } => {
+                w.f32(dx).f32(dy);
+                (kind::INPUT_SCROLL, w.finish().to_vec())
+            }
+        }
+    }
+}
+
+/// Writes one input message to the control stream's send half.
+pub async fn write_input(send: &mut quinn::SendStream, input: &Input) -> Result<()> {
+    let (kind, body) = input.encode();
+    wire::write_msg(send, kind, &body).await
+}
+
 /// A message read from the control stream.
 #[derive(Debug)]
 pub enum Message {
@@ -207,28 +241,37 @@ pub struct Control {
     pub info: HostInfo,
 }
 
+/// Parses one framed control message from its kind and body.
+fn decode_message(k: u8, body: Vec<u8>) -> Result<Message> {
+    let mut r = Reader::new(&body);
+    Ok(match k {
+        kind::VIDEO_START => Message::VideoStart(VideoStart { width: r.u32()?, height: r.u32()?, codec: r.u8()? }),
+        kind::VIDEO_FRAME => {
+            let keyframe = r.u8()? != 0;
+            Message::VideoFrame(VideoFrame { keyframe, data: r.rest().to_vec() })
+        }
+        kind::TEST_FRAME => {
+            let width = r.u32()?;
+            let height = r.u32()?;
+            Message::TestFrame(TestFrame { width, height, rgba: r.rest().to_vec() })
+        }
+        kind::ERROR => Message::Error(error_text(&body)),
+        other => Message::Other(other, body),
+    })
+}
+
+/// Reads and parses the next control message from a receive stream, or `None` on clean EOF.
+pub async fn read_message(recv: &mut quinn::RecvStream) -> Result<Option<Message>> {
+    match wire::read_msg_opt(recv).await? {
+        Some((k, body)) => Ok(Some(decode_message(k, body)?)),
+        None => Ok(None),
+    }
+}
+
 impl Control {
     /// Reads the next control message, or `None` when the host closed the stream.
     pub async fn recv(&mut self) -> Result<Option<Message>> {
-        let Some((k, body)) = wire::read_msg_opt(&mut self.recv).await? else {
-            return Ok(None);
-        };
-        let mut r = Reader::new(&body);
-        let message = match k {
-            kind::VIDEO_START => Message::VideoStart(VideoStart { width: r.u32()?, height: r.u32()?, codec: r.u8()? }),
-            kind::VIDEO_FRAME => {
-                let keyframe = r.u8()? != 0;
-                Message::VideoFrame(VideoFrame { keyframe, data: r.rest().to_vec() })
-            }
-            kind::TEST_FRAME => {
-                let width = r.u32()?;
-                let height = r.u32()?;
-                Message::TestFrame(TestFrame { width, height, rgba: r.rest().to_vec() })
-            }
-            kind::ERROR => Message::Error(error_text(&body)),
-            other => Message::Other(other, body),
-        };
-        Ok(Some(message))
+        read_message(&mut self.recv).await
     }
 
     /// Reads the next control message as a test frame (checkpoint 1b).
@@ -243,6 +286,11 @@ impl Control {
     /// Keep the writer reachable for later input/clipboard messages.
     pub fn sender(&mut self) -> &mut quinn::SendStream {
         &mut self.send
+    }
+
+    /// Splits into the raw halves so a client can read video and send input concurrently.
+    pub fn into_parts(self) -> (HostInfo, quinn::SendStream, quinn::RecvStream) {
+        (self.info, self.send, self.recv)
     }
 }
 

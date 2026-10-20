@@ -15,7 +15,7 @@ aktivestream-rfb.workspace = true
 aktivestream-keymap.workspace = true
 aktivestream-proto = { path = "../aktivestream-proto" }
 aktivestream-video = { path = "../aktivestream-video" }
-tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "macros"] }
+tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }
 # Writes --screenshot captures (diagnostics); same version as aktivestream-rfb's smoke example.
 png = "0.17"
 

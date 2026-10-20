@@ -41,6 +41,9 @@ func serve(port: UInt16) {
                 log("screen recording: not granted yet - enable 'AktiveStream Host' in System Settings > Privacy & Security > Screen Recording (\(error))")
             }
         }
+        // Register for (and report) Accessibility, needed to inject keyboard/mouse input.
+        let axGranted = accessibilityGranted(prompt: false)
+        log("accessibility: \(axGranted ? "granted" : "not granted yet - enable 'AktiveStream Host' in System Settings > Privacy & Security > Accessibility")")
         try listener.start()
         dispatchMain()
     } catch {

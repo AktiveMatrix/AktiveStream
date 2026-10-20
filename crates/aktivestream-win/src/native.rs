@@ -1,20 +1,21 @@
 //! Phase 2 native client path: connect to the Swift host over QUIC, decode its HEVC video
-//! stream, and present it in the same window/renderer the RFB path uses. View-only for now;
-//! input injection follows once the host accepts native keycodes.
+//! stream, and present it in the same window/renderer the RFB path uses, while sending
+//! keyboard/mouse input back on the same stream.
 
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use aktivestream_proto::{DEFAULT_PORT, Message, connect};
+use aktivestream_proto::{DEFAULT_PORT, Input, Message, connect, read_message, write_input};
 use aktivestream_video::{Codec, Decoder, init as video_init};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::Args;
-use crate::app;
+use crate::app::{self, Backend};
 use crate::net::Shared;
 
-/// Connects, learns the remote size, then runs the window with a background decode thread.
+/// Connects, learns the remote size, then runs the window with a background decode/input thread.
 pub fn run(args: &Args) -> Result<(), String> {
     // The native host listens on 35390; a user who typed no port gets the rfb default (5900),
     // so treat that as "use the native default".
@@ -24,13 +25,11 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let (info_tx, info_rx) = mpsc::channel::<Result<(u32, u32, String), String>>();
     let (shared_tx, shared_rx) = mpsc::channel::<Arc<Shared>>();
+    let (input_tx, input_rx) = unbounded_channel::<Input>();
 
     thread::Builder::new()
         .name("native-session".into())
         .spawn(move || {
-            // Multi-thread so quinn's endpoint driver gets a worker thread; the session future
-            // (which holds the non-Send Media Foundation decoder) still runs on this thread via
-            // block_on, so the decoder never crosses threads.
             let runtime = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
                 Ok(rt) => rt,
                 Err(e) => {
@@ -39,9 +38,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 }
             };
             let info_for_err = info_tx.clone();
-            if let Err(e) = runtime.block_on(session(host, port, password, info_tx, shared_rx)) {
-                // Reaches the main thread only if nothing was sent yet (connection never reached
-                // VideoStart); otherwise the receiver is gone and this is dropped.
+            if let Err(e) = runtime.block_on(session(host, port, password, info_tx, shared_rx, input_rx)) {
                 let _ = info_for_err.send(Err(e));
             }
         })
@@ -49,7 +46,7 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let (w, h, name) = info_rx.recv().map_err(|_| "native connection failed".to_string())??;
     let shared = Arc::new(Shared::new(w.min(u16::MAX.into()) as u16, h.min(u16::MAX.into()) as u16));
-    app::run_window(args, shared, name, move |shared, _rx| {
+    app::run_window(args, shared, name, Backend::Native(input_tx), move |shared, _rx| {
         let _ = shared_tx.send(shared);
     })
 }
@@ -60,6 +57,7 @@ async fn session(
     password: String,
     info_tx: mpsc::Sender<Result<(u32, u32, String), String>>,
     shared_rx: mpsc::Receiver<Arc<Shared>>,
+    mut input_rx: UnboundedReceiver<Input>,
 ) -> Result<(), String> {
     let socket = format!("{host}:{port}")
         .to_socket_addrs()
@@ -67,55 +65,61 @@ async fn session(
         .next()
         .ok_or("could not resolve host")?;
     let connection = connect(socket, None).await.map_err(|e| e.to_string())?;
-    let mut control = connection.control("aktivestream-win", &password).await.map_err(|e| e.to_string())?;
-    let name = control.info.name.clone();
+    let control = connection.control("aktivestream-win", &password).await.map_err(|e| e.to_string())?;
+    let (info, mut send, mut recv) = control.into_parts();
+    let name = info.name;
 
     let mut active: Option<(Decoder, Arc<Shared>)> = None;
     loop {
-        // Once a window exists, surface errors through it rather than only returning them.
-        let message = match control.recv().await {
-            Ok(m) => m,
-            Err(e) => {
-                if let Some((_, shared)) = &active {
-                    shared.report_error(format!("Connection lost: {e}"));
-                }
-                return Err(e.to_string());
-            }
-        };
-        match message {
-            Some(Message::VideoStart(start)) => {
-                video_init().map_err(|e| e.to_string())?;
-                let codec = if start.codec == 1 { Codec::H264 } else { Codec::Hevc };
-                let decoder = Decoder::new(codec, start.width, start.height).map_err(|e| e.to_string())?;
-                // Hand the dimensions to the main thread so it can size and show the window,
-                // then wait for the shared framebuffer it creates.
-                info_tx.send(Ok((start.width, start.height, name.clone()))).map_err(|_| "window gone")?;
-                let shared = shared_rx.recv().map_err(|_| "window gone".to_string())?;
-                active = Some((decoder, shared));
-            }
-            Some(Message::VideoFrame(frame)) => {
-                if let Some((decoder, shared)) = active.as_mut() {
-                    match decoder.decode(&frame.data) {
-                        Ok(frames) => {
-                            for decoded in frames {
-                                shared.present_decoded(decoded.width, decoded.height, &decoded.rgba);
+        tokio::select! {
+            // Video from the host.
+            message = read_message(&mut recv) => {
+                let message = match message {
+                    Ok(m) => m,
+                    Err(e) => { fail(&active, &e.to_string()); return Err(e.to_string()); }
+                };
+                match message {
+                    Some(Message::VideoStart(start)) => {
+                        video_init().map_err(|e| e.to_string())?;
+                        let codec = if start.codec == 1 { Codec::H264 } else { Codec::Hevc };
+                        let decoder = Decoder::new(codec, start.width, start.height).map_err(|e| e.to_string())?;
+                        info_tx.send(Ok((start.width, start.height, name.clone()))).map_err(|_| "window gone")?;
+                        let shared = shared_rx.recv().map_err(|_| "window gone".to_string())?;
+                        active = Some((decoder, shared));
+                    }
+                    Some(Message::VideoFrame(frame)) => {
+                        if let Some((decoder, shared)) = active.as_mut() {
+                            match decoder.decode(&frame.data) {
+                                Ok(frames) => {
+                                    for decoded in frames {
+                                        shared.present_decoded(decoded.width, decoded.height, &decoded.rgba);
+                                    }
+                                }
+                                Err(e) => { shared.report_error(format!("Connection lost: {e}")); return Err(e.to_string()); }
                             }
                         }
-                        Err(e) => {
-                            shared.report_error(format!("Connection lost: {e}"));
-                            return Err(e.to_string());
-                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        if let Some((_, shared)) = &active { shared.disconnect(); }
+                        break;
                     }
                 }
             }
-            Some(_) => {}
-            None => {
-                if let Some((_, shared)) = &active {
-                    shared.disconnect();
+            // Input to the host.
+            Some(input) = input_rx.recv() => {
+                if let Err(e) = write_input(&mut send, &input).await {
+                    fail(&active, &e.to_string());
+                    return Err(e.to_string());
                 }
-                break;
             }
         }
     }
     Ok(())
+}
+
+fn fail(active: &Option<(Decoder, Arc<Shared>)>, error: &str) {
+    if let Some((_, shared)) = active {
+        shared.report_error(format!("Connection lost: {error}"));
+    }
 }

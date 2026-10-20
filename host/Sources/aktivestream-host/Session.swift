@@ -15,6 +15,9 @@ enum MsgKind {
     static let testFrame: UInt8 = 20
     static let videoFrame: UInt8 = 21
     static let videoStart: UInt8 = 22
+    static let inputKey: UInt8 = 30
+    static let inputPointer: UInt8 = 31
+    static let inputScroll: UInt8 = 32
 }
 
 /// How many synthetic frames `serve` streams before closing (checkpoint 2c).
@@ -112,7 +115,15 @@ func runSession(_ connection: NWConnection) async {
         // Checkpoint 1b: accept any token. Real check (macOS account + TLS channel binding) later.
         log("session: Auth received (\(authBody.count) bytes), accepting")
         try await writeMessage(connection, kind: MsgKind.authOk, body: Data())
-        try await streamVideo(connection)
+        // Stream video (host->client) and read input (client->host) concurrently on the
+        // same QUIC stream; either ending (a disconnect) ends the session.
+        let box = SendableBox(value: connection)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { try? await streamVideo(box.value) }
+            group.addTask { await readInput(box.value) }
+            await group.next()
+            group.cancelAll()
+        }
     } catch {
         log("session ended: \(error)")
     }

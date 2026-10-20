@@ -15,9 +15,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use aktivestream_keymap::native::NativeInput;
 use aktivestream_keymap::{
     Disposition, Engine, HostEvent, Key, KeyInput, LocalAction, MouseButton, Profile, RfbTranslator,
 };
+use aktivestream_proto::Input;
 use aktivestream_rfb::{CursorShape, Rect, ServerInfo, SessionReader, SessionWriter};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -70,6 +72,25 @@ const WHEEL_LEFT: u8 = 32;
 const WHEEL_RIGHT: u8 = 64;
 const WHEEL_DELTA: i32 = 120;
 
+/// Where input is sent: the RFB writer (key symbols) or the native host (keycodes).
+#[derive(Clone)]
+enum Sink {
+    Rfb(Sender<Out>),
+    Native(tokio::sync::mpsc::UnboundedSender<Input>),
+}
+
+/// How keyboard events become wire events for the chosen backend.
+enum KeyTranslator {
+    Rfb(RfbTranslator),
+    Native(NativeInput),
+}
+
+/// Which backend a session uses, chosen at startup (RFB or the Phase 2 native host).
+pub enum Backend {
+    Rfb,
+    Native(tokio::sync::mpsc::UnboundedSender<Input>),
+}
+
 /// Keyboard state shared by the hook thread and the UI thread.
 struct KeyCtx {
     hwnd: AtomicIsize,
@@ -79,8 +100,8 @@ struct KeyCtx {
 
 struct KeyState {
     engine: Engine,
-    translator: RfbTranslator,
-    tx: Sender<Out>,
+    translator: KeyTranslator,
+    sink: Sink,
     /// Caps Lock toggle, tracked from the hook: the hook thread receives no keyboard
     /// messages, so its own GetKeyState would be stale.
     caps: bool,
@@ -89,17 +110,34 @@ struct KeyState {
 }
 
 impl KeyState {
-    /// Sends host events as keysyms (unless view-only) and returns what was sent.
+    /// Sends host events to the backend (unless view-only) and returns `(code, down)` pairs
+    /// for the key log (a key symbol for RFB, a keycode for native).
     fn send_host(&mut self, events: Vec<HostEvent>, view_only: bool) -> Vec<(u32, bool)> {
         let mut sent = Vec::new();
-        self.translator.set_caps_lock(self.caps);
-        for event in events {
-            for (keysym, down) in self.translator.translate(event) {
-                if !view_only {
-                    let _ = self.tx.send(Out::Key(keysym, down));
+        let caps = self.caps;
+        match (&mut self.translator, &self.sink) {
+            (KeyTranslator::Rfb(translator), Sink::Rfb(tx)) => {
+                translator.set_caps_lock(caps);
+                for event in events {
+                    for (keysym, down) in translator.translate(event) {
+                        if !view_only {
+                            let _ = tx.send(Out::Key(keysym, down));
+                        }
+                        sent.push((keysym, down));
+                    }
                 }
-                sent.push((keysym, down));
             }
+            (KeyTranslator::Native(input), Sink::Native(tx)) => {
+                for event in events {
+                    if let Some(k) = input.translate(event) {
+                        if !view_only {
+                            let _ = tx.send(Input::Key { keycode: k.keycode, down: k.down, flags: k.flags });
+                        }
+                        sent.push((u32::from(k.keycode), k.down));
+                    }
+                }
+            }
+            _ => {}
         }
         sent
     }
@@ -119,11 +157,22 @@ fn keys() -> MutexGuard<'static, KeyState> {
     ctx.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Pixels the native host scrolls per standard wheel notch (WHEEL_DELTA). Configurable via the
+/// AKTIVESTREAM_SCROLL env var (a float; higher is faster). Default 160; Apple's own notch is
+/// roughly 120. Touchpad "precision" wheel messages carry smaller deltas and scale the same way.
+fn scroll_px_from_env() -> f32 {
+    std::env::var("AKTIVESTREAM_SCROLL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(160.0)
+}
+
 struct App {
     hwnd: HWND,
     hook_thread: u32,
     shared: Arc<Shared>,
-    tx: Sender<Out>,
+    sink: Sink,
     name: String,
     view: View,
     renderer: Option<Renderer>,
@@ -141,6 +190,7 @@ struct App {
     paint_time: Duration,
     screenshot: Option<std::path::PathBuf>,
     view_only: bool,
+    scroll_px: f32,
 }
 
 thread_local! {
@@ -304,7 +354,33 @@ fn spawn_hook_thread() -> Result<u32, String> {
 impl App {
     fn send(&self, message: Out) {
         // A closed channel means the writer saw the connection drop; the reader reports it.
-        let _ = self.tx.send(message);
+        match &self.sink {
+            Sink::Rfb(tx) => {
+                let _ = tx.send(message);
+            }
+            Sink::Native(tx) => match message {
+                Out::Pointer(buttons, x, y) => {
+                    let (fw, fh) = (self.view.fb_w.max(1) as f32, self.view.fb_h.max(1) as f32);
+                    // Wire button order: bit0 left, bit1 right, bit2 middle.
+                    let native = (buttons & 1)
+                        | (if buttons & BUTTON_RIGHT != 0 { 2 } else { 0 })
+                        | (if buttons & BUTTON_MIDDLE != 0 { 4 } else { 0 });
+                    let _ = tx.send(Input::Pointer { buttons: native, x: f32::from(x) / fw, y: f32::from(y) / fh });
+                }
+                // Key events go through KeyState for native; clipboard sync is not wired yet.
+                Out::Key(..) | Out::CutText(_) => {}
+            },
+        }
+    }
+
+    fn is_native(&self) -> bool {
+        matches!(self.sink, Sink::Native(_))
+    }
+
+    fn send_scroll(&self, dx: f32, dy: f32) {
+        if let Sink::Native(tx) = &self.sink {
+            let _ = tx.send(Input::Scroll { dx, dy });
+        }
     }
 
     fn send_host(&self, events: Vec<HostEvent>) {
@@ -469,6 +545,11 @@ impl App {
             WM_MBUTTONDOWN => self.press(BUTTON_MIDDLE),
             WM_MBUTTONUP => self.buttons &= !BUTTON_MIDDLE,
             WM_MOUSEWHEEL => {
+                if self.is_native() {
+                    // Native host takes pixel scroll deltas; scale a notch to scroll_px pixels.
+                    self.send_scroll(0.0, wheel_delta as f32 / WHEEL_DELTA as f32 * self.scroll_px);
+                    return;
+                }
                 self.wheel += wheel_delta;
                 while self.wheel >= WHEEL_DELTA {
                     self.click(WHEEL_UP, x, y);
@@ -481,6 +562,10 @@ impl App {
                 return;
             }
             WM_MOUSEHWHEEL => {
+                if self.is_native() {
+                    self.send_scroll(wheel_delta as f32 / WHEEL_DELTA as f32 * self.scroll_px, 0.0);
+                    return;
+                }
                 self.hwheel += wheel_delta;
                 while self.hwheel >= WHEEL_DELTA {
                     self.click(WHEEL_RIGHT, x, y);
@@ -810,7 +895,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 pub fn run(args: &Args, session: (ServerInfo, SessionReader, SessionWriter)) -> Result<(), String> {
     let (info, reader, writer) = session;
     let shared = Arc::new(Shared::new(info.width, info.height));
-    run_window(args, shared, info.name, move |shared, rx| {
+    run_window(args, shared, info.name, Backend::Rfb, move |shared, rx| {
         net::spawn_reader(shared.clone(), reader);
         net::spawn_writer(shared, writer, rx);
     })
@@ -823,9 +908,14 @@ pub fn run_window(
     args: &Args,
     shared: Arc<Shared>,
     host_name: String,
+    backend: Backend,
     start_source: impl FnOnce(Arc<Shared>, mpsc::Receiver<Out>),
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
+    let (sink, translator) = match backend {
+        Backend::Rfb => (Sink::Rfb(tx.clone()), KeyTranslator::Rfb(RfbTranslator::new())),
+        Backend::Native(input_tx) => (Sink::Native(input_tx), KeyTranslator::Native(NativeInput::new())),
+    };
     let fail = |what: &str, e: windows::core::Error| format!("{what} failed: {e}");
     let (fb_w, fb_h) = {
         let fb = shared.framebuffer.lock().unwrap();
@@ -875,8 +965,8 @@ pub fn run_window(
         view_only: args.view_only,
         state: Mutex::new(KeyState {
             engine: Engine::new(Profile::mac_default()),
-            translator: RfbTranslator::new(),
-            tx: tx.clone(),
+            translator,
+            sink: sink.clone(),
             caps: unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0,
             caps_held: false,
             keylog,
@@ -896,7 +986,7 @@ pub fn run_window(
         hwnd,
         hook_thread,
         shared: shared.clone(),
-        tx,
+        sink,
         name: host_name,
         view: View::default(),
         renderer,
@@ -914,6 +1004,7 @@ pub fn run_window(
         paint_time: Duration::ZERO,
         screenshot: args.screenshot.clone(),
         view_only: args.view_only,
+        scroll_px: scroll_px_from_env(),
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(App::update_view);

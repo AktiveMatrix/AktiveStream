@@ -15,6 +15,7 @@ use bitflags::bitflags;
 mod engine;
 mod key;
 mod keysym;
+pub mod native;
 mod profile;
 
 /// A physical key on a PC keyboard, named by position on a US layout.
