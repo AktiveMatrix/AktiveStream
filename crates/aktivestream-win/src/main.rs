@@ -9,6 +9,7 @@ mod cursor;
 mod diag;
 mod native;
 mod net;
+mod picker;
 mod render;
 mod view;
 
@@ -145,6 +146,10 @@ fn run() -> Result<(), String> {
     // Physical pixels everywhere: the Mac's Retina framebuffer should not be stretched twice.
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+    // No arguments: show the connection picker, which launches the chosen connection.
+    if std::env::args().len() == 1 {
+        return picker::run(config::load());
     }
     let args = parse_args()?;
     if args.exit_after.is_some() {

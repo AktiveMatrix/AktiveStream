@@ -1,0 +1,89 @@
+//! Software-drawing primitives shared by the client overlays (the toolbar and the connection
+//! picker): direct writes to a `0x00RRGGBB` pixel buffer, with the public-domain 8x8 bitmap font
+//! for text. No platform dependencies, so every client composites the same way.
+
+use font8x8::UnicodeFonts;
+
+/// Fills a rectangle, clipped to the buffer.
+pub fn fill_rect(buf: &mut [u32], dw: usize, x0: usize, y0: usize, w: usize, h: usize, color: u32) {
+    for y in y0..y0 + h {
+        let row = y * dw;
+        for x in x0..x0 + w {
+            if let Some(px) = buf.get_mut(row + x) {
+                *px = color;
+            }
+        }
+    }
+}
+
+/// Draws a 1px rectangle outline.
+pub fn rect_outline(buf: &mut [u32], dw: usize, x: usize, y: usize, w: usize, h: usize, color: u32) {
+    for i in 0..w {
+        if let Some(px) = buf.get_mut(y * dw + x + i) {
+            *px = color;
+        }
+        if let Some(px) = buf.get_mut((y + h - 1) * dw + x + i) {
+            *px = color;
+        }
+    }
+    for i in 0..h {
+        if let Some(px) = buf.get_mut((y + i) * dw + x) {
+            *px = color;
+        }
+        if let Some(px) = buf.get_mut((y + i) * dw + x + w - 1) {
+            *px = color;
+        }
+    }
+}
+
+/// Draws a diagonal cross (an X) in a `size`x`size` box.
+pub fn cross(buf: &mut [u32], dw: usize, x: usize, y: usize, size: usize, color: u32) {
+    for i in 0..size {
+        if let Some(px) = buf.get_mut((y + i) * dw + x + i) {
+            *px = color;
+        }
+        if let Some(px) = buf.get_mut((y + i) * dw + x + size - 1 - i) {
+            *px = color;
+        }
+    }
+}
+
+/// Draws `text` with the 8x8 bitmap font, each glyph pixel scaled to a `scale`x`scale` block
+/// (scale 1 = 8px tall, 2 = 16px, …), stopping at `max_x` or the buffer edge. Returns the x
+/// just past the last glyph drawn.
+#[allow(clippy::too_many_arguments)]
+pub fn text(buf: &mut [u32], dw: usize, x0: usize, y: usize, s: &str, color: u32, max_x: usize, scale: usize) -> usize {
+    let scale = scale.max(1);
+    let advance = 8 * scale;
+    let mut x = x0;
+    for ch in s.chars() {
+        if x + advance > max_x {
+            break;
+        }
+        if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..8 {
+                    if (bits >> col) & 1 == 0 {
+                        continue;
+                    }
+                    for dy in 0..scale {
+                        let py = y + row * scale + dy;
+                        let base = py * dw + x + col * scale;
+                        for dx in 0..scale {
+                            if let Some(px) = buf.get_mut(base + dx) {
+                                *px = color;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        x += advance;
+    }
+    x
+}
+
+/// Width in pixels that `text` would occupy at `scale` (8px per glyph, times the scale).
+pub fn text_width(s: &str, scale: usize) -> usize {
+    s.chars().count() * 8 * scale.max(1)
+}

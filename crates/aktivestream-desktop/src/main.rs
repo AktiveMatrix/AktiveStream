@@ -10,9 +10,10 @@ mod keys;
 #[cfg(feature = "native")]
 mod native;
 
-use aktivestream_client::{bar, config, tunnel};
+use aktivestream_client::{bar, config, picker, tunnel};
 
 use std::num::NonZeroU32;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -539,6 +540,144 @@ impl ApplicationHandler<()> for App {
 
 /// Connects, decodes the first framebuffer update, writes it to a PNG, and exits. Lets us verify
 /// the RFB pipeline on Linux without a display server or a screenshot tool.
+/// The connection picker window, shown when the client starts with no target. On a choice it
+/// launches `aktivestream <name>` as a fresh process (its own session window) and closes, so the
+/// picker and the session never share a winit event loop.
+struct PickerApp {
+    entries: Vec<config::Connection>,
+    selected: usize,
+    cursor: (f64, f64),
+    window: Option<Rc<Window>>,
+    surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    chosen: Option<String>,
+}
+
+impl PickerApp {
+    fn redraw(&mut self) {
+        let (Some(window), Some(surface)) = (self.window.clone(), self.surface.as_mut()) else {
+            return;
+        };
+        let size = window.inner_size();
+        let (Some(dw), Some(dh)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
+            return;
+        };
+        if surface.resize(dw, dh).is_err() {
+            return;
+        }
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
+        picker::draw_picker(&mut buffer, dw.get() as usize, dh.get() as usize, &self.entries, self.selected);
+        let _ = buffer.present();
+    }
+
+    fn window_height(&self) -> usize {
+        self.window.as_ref().map_or(0, |w| w.inner_size().height as usize)
+    }
+
+    fn step(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let n = self.entries.len() as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    fn choose(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(c) = self.entries.get(self.selected) {
+            self.chosen = Some(c.name.clone());
+        }
+        event_loop.exit();
+    }
+}
+
+impl ApplicationHandler<()> for PickerApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let rows = self.entries.len().max(1);
+        let height = (picker::TOP + rows * picker::ROW_H + 24).min(760) as f64;
+        let attrs =
+            Window::default_attributes().with_title("AktiveStream").with_inner_size(LogicalSize::new(680.0, height));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Rc::new(w),
+            Err(e) => {
+                eprintln!("window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+        match Context::new(window.clone()).and_then(|ctx| Surface::new(&ctx, window.clone())) {
+            Ok(s) => self.surface = Some(s),
+            Err(e) => {
+                eprintln!("surface: {e}");
+                event_loop.exit();
+                return;
+            }
+        }
+        self.window = Some(window.clone());
+        window.request_redraw();
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Resized(_) => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                if let Some(idx) = picker::row_at(self.cursor, self.window_height(), self.entries.len())
+                    && idx != self.selected
+                {
+                    self.selected = idx;
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: WinitButton::Left, .. } => {
+                if let Some(idx) = picker::row_at(self.cursor, self.window_height(), self.entries.len()) {
+                    self.selected = idx;
+                    self.choose(event_loop);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    use winit::keyboard::KeyCode;
+                    match code {
+                        KeyCode::ArrowDown => self.step(1),
+                        KeyCode::ArrowUp => self.step(-1),
+                        KeyCode::Enter | KeyCode::NumpadEnter => self.choose(event_loop),
+                        KeyCode::Escape => event_loop.exit(),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Shows the connection picker; on a choice, launches `aktivestream <name>` as a fresh process.
+fn run_picker(entries: Vec<config::Connection>) -> Result<(), String> {
+    let event_loop = EventLoop::<()>::with_user_event().build().map_err(|e| e.to_string())?;
+    let mut app = PickerApp { entries, selected: 0, cursor: (0.0, 0.0), window: None, surface: None, chosen: None };
+    event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
+    if let Some(name) = app.chosen {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        Command::new(exe).arg(&name).spawn().map_err(|e| format!("launch {name}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn run_snapshot(options: ConnectOptions, path: &str) -> Result<(), String> {
     let (info, mut reader, _writer) = connect(&options).map_err(|e| e.to_string())?;
     let framebuffer = Mutex::new(Framebuffer::new(info.width as u32, info.height as u32));
@@ -617,10 +756,52 @@ fn bar_preview(path: &str) -> Result<(), String> {
     writer.write_image_data(&rgb).map_err(|e| e.to_string())
 }
 
+/// Headless render of the connection picker to a PNG (AKTIVE_PICKER_PREVIEW), for verifying its
+/// layout without a display. Uses the saved phone book, or a sample list when it is empty.
+fn picker_preview(path: &str) -> Result<(), String> {
+    use config::{Connection, Mode};
+    let mut entries = config::load();
+    if entries.is_empty() {
+        let sample = |name: &str, host: &str, port: u16, mode: Mode| Connection {
+            name: name.into(),
+            host: host.into(),
+            port,
+            mode,
+            username: None,
+            tunnel: None,
+        };
+        entries = vec![
+            sample("studio", "mac-studio.local", 5900, Mode::Native),
+            sample("air", "192.168.1.50", 5900, Mode::Rfb),
+            sample("work-mac", "10.0.0.9", 5900, Mode::Rfb),
+        ];
+    }
+    let w = 680usize;
+    let h = (picker::TOP + entries.len() * picker::ROW_H + 24).min(760);
+    let mut buf = vec![0u32; w * h];
+    picker::draw_picker(&mut buf, w, h, &entries, 0);
+
+    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for p in &buf {
+        rgb.push((p >> 16) as u8);
+        rgb.push((p >> 8) as u8);
+        rgb.push(*p as u8);
+    }
+    writer.write_image_data(&rgb).map_err(|e| e.to_string())
+}
+
 fn main() -> Result<(), String> {
     let _ = env_logger::try_init();
     if let Ok(path) = std::env::var("AKTIVE_BAR_PREVIEW") {
         return bar_preview(&path);
+    }
+    if let Ok(path) = std::env::var("AKTIVE_PICKER_PREVIEW") {
+        return picker_preview(&path);
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -650,10 +831,10 @@ fn main() -> Result<(), String> {
     if native_flag {
         args.remove(0);
     }
-    let target = args
-        .first()
-        .cloned()
-        .ok_or("usage: aktivestream [--native] [--tunnel <ssh>] <host-or-name> [port] | --list")?;
+    let Some(target) = args.first().cloned() else {
+        // No target given: show the connection picker, which launches the chosen connection.
+        return run_picker(config::load());
+    };
     let title = target.clone();
     let port_arg: Option<u16> = args.get(1).and_then(|p| p.parse().ok());
 
