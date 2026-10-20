@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 aktivestream-rfb.workspace = true
 aktivestream-keymap.workspace = true
+aktivestream-client = { path = "../aktivestream-client" }
 aktivestream-proto = { path = "../aktivestream-proto" }
 # Cross-platform windowing (X11 + Wayland) and a CPU framebuffer surface.
 winit = "0.30"
@@ -25,8 +26,11 @@ font8x8 = "0.3"
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "time", "macros"] }
 # Opt-in diagnostics for the QUIC/TLS handshake (RUST_LOG=…); quinn/rustls use the log crate.
 env_logger = "0.11"
+# The native QUIC/HEVC path's video decoder. Optional and gated behind the `native` feature:
+# ffmpeg bindings are pinned to the system ffmpeg's major version (ffmpeg-next 9 wants ffmpeg 8)
+# and ffmpeg cannot build on Windows, so the RFB client builds everywhere without it. Build the
+# native path with `--features native` on a Linux box that has ffmpeg's dev libraries.
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 
-# The native QUIC/HEVC path needs a Linux video decoder (ffmpeg, VA-API-capable). ffmpeg can't
-# build on Windows, so it is Linux-only; the RFB path above stays cross-platform.
-[target.'cfg(target_os = "linux")'.dependencies]
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"] }
+[features]
+native = ["dep:ffmpeg-next"]

@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 aktivestream-rfb.workspace = true
 aktivestream-keymap.workspace = true
+aktivestream-client = { path = "../aktivestream-client" }
 aktivestream-proto = { path = "../aktivestream-proto" }
 aktivestream-video = { path = "../aktivestream-video" }
 tokio = { version = "1.42", features = ["rt", "rt-multi-thread", "net", "sync", "macros"] }

@@ -6,11 +6,11 @@
 //!
 //! Usage: aktivestream <host> [port]   (env RFB_USER, RFB_PASSWORD)
 
-mod config;
 mod keys;
-#[cfg(target_os = "linux")]
+#[cfg(feature = "native")]
 mod native;
-mod tunnel;
+
+use aktivestream_client::{config, tunnel};
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
@@ -636,8 +636,9 @@ fn main() -> Result<(), String> {
     let tunnel = tunnel_flag.or_else(|| saved.and_then(|c| c.tunnel));
 
     // Native path (QUIC + hardware video decode): windowed (saved `native` mode or `--native`), or
-    // a headless test/bench mode. Uses AS_PASSWORD (the host accepts any for now).
-    #[cfg(target_os = "linux")]
+    // a headless test/bench mode. Uses AS_PASSWORD (the host accepts any for now). Built only with
+    // `--features native` (needs ffmpeg); otherwise this binary is the RFB client only.
+    #[cfg(feature = "native")]
     {
         let as_password = || std::env::var("AS_PASSWORD").unwrap_or_else(|_| "native".into());
         let native_host = format!("{host}:{port}");
@@ -660,8 +661,13 @@ fn main() -> Result<(), String> {
             return native::run_native(native_host, as_password(), title);
         }
     }
-    #[cfg(not(target_os = "linux"))]
-    let _ = use_native;
+    #[cfg(not(feature = "native"))]
+    if use_native {
+        return Err(
+            "the native path is not built in this binary; rebuild with `--features native` on a Linux box with ffmpeg"
+                .into(),
+        );
+    }
 
     // RFB path, optionally through an SSH tunnel. Keep the tunnel alive for the whole session.
     let _tunnel: Option<tunnel::Tunnel>;

@@ -58,6 +58,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aktivestream-client"
+version = "0.1.0"
+
+[[package]]
 name = "aktivestream-keymap"
 version = "0.1.0"
 dependencies = [
@@ -68,6 +72,7 @@ dependencies = [
 name = "aktivestream-linux"
 version = "0.1.0"
 dependencies = [
+ "aktivestream-client",
  "aktivestream-keymap",
  "aktivestream-proto",
  "aktivestream-rfb",
@@ -122,6 +127,7 @@ dependencies = [
 name = "aktivestream-win"
 version = "0.1.0"
 dependencies = [
+ "aktivestream-client",
  "aktivestream-keymap",
  "aktivestream-proto",
  "aktivestream-rfb",

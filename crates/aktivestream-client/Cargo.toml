@@ -1,0 +1,9 @@
+[package]
+name = "aktivestream-client"
+description = "Shared, platform-neutral client logic: the connection phone book and the SSH tunnel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]

@@ -1,4 +1,4 @@
-//! AktiveStream for Windows: a client for macOS Screen Sharing with a PC-to-Mac
+//! AktiveStream for Windows: a client for macOS Screen Sharing with the macOS
 //! keyboard profile.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -12,14 +12,17 @@ mod net;
 mod render;
 mod view;
 
+use aktivestream_client::{config, tunnel};
 use aktivestream_rfb::{ConnectOptions, Error as RfbError};
 use windows::Win32::Foundation::ERROR_LOGON_FAILURE;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 
-const USAGE: &str = "usage: aktivestream <host>[:port] [--user NAME] [--fullscreen] [--forget]\n\n\
+const USAGE: &str = "usage: aktivestream <host-or-saved-name>[:port] [--user NAME] [--fullscreen] [--forget]\n       aktivestream --list\n\n\
   --user NAME            Mac account name to suggest in the login prompt\n\
   --fullscreen           start in full screen\n\
-  --forget               delete the saved login for this host first\n\n\
+  --forget               delete the saved login for this host first\n\
+  --tunnel SSH           reach the Mac through an ssh -L forward (VNC only; Tailscale needs none)\n\
+  --list                 print saved connections (phone book) and exit\n\n\
 diagnostics:\n\
   --password-env VAR     take the password from environment variable VAR (with --user);\n\
                          skips the prompt and Credential Manager\n\
@@ -41,6 +44,7 @@ pub struct Args {
     pub view_only: bool,
     pub keylog: Option<std::path::PathBuf>,
     pub native: bool,
+    pub tunnel: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -54,6 +58,8 @@ fn parse_args() -> Result<Args, String> {
     let mut view_only = false;
     let mut keylog = None;
     let mut native = false;
+    let mut list = false;
+    let mut tunnel = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -62,6 +68,8 @@ fn parse_args() -> Result<Args, String> {
             "--forget" => forget = true,
             "--view-only" => view_only = true,
             "--native" => native = true,
+            "--list" => list = true,
+            "--tunnel" => tunnel = Some(args.next().ok_or("--tunnel needs an ssh destination")?),
             "--keylog" => keylog = Some(args.next().ok_or("--keylog needs a path")?.into()),
             "--password-env" => password_env = Some(args.next().ok_or("--password-env needs a variable name")?),
             "--screenshot" => screenshot = Some(args.next().ok_or("--screenshot needs a path")?.into()),
@@ -75,12 +83,54 @@ fn parse_args() -> Result<Args, String> {
             _ => return Err(format!("unexpected argument {arg}\n\n{USAGE}")),
         }
     }
+    if list {
+        print_phone_book();
+        std::process::exit(0);
+    }
     let target = host.ok_or_else(|| USAGE.to_string())?;
-    let (host, port) = match target.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().map_err(|_| format!("bad port in {target}"))?),
-        _ => (target, 5900),
+    // Phone book: a saved connection name resolves to its host/port/mode/user/tunnel; otherwise
+    // the argument is a host[:port].
+    let (host, port, saved_native, saved_user, saved_tunnel) = match config::find(&target) {
+        Some(c) => (c.host, c.port, c.mode == config::Mode::Native, c.username, c.tunnel),
+        None => {
+            let (h, p) = match target.rsplit_once(':') {
+                Some((h, p)) if !h.contains(':') => {
+                    (h.to_string(), p.parse().map_err(|_| format!("bad port in {target}"))?)
+                }
+                _ => (target, 5900),
+            };
+            (h, p, false, None, None)
+        }
     };
-    Ok(Args { host, port, user, fullscreen, forget, password_env, screenshot, exit_after, view_only, keylog, native })
+    let native = native || saved_native;
+    let user = user.or(saved_user);
+    let tunnel = tunnel.or(saved_tunnel);
+    Ok(Args {
+        host,
+        port,
+        user,
+        fullscreen,
+        forget,
+        password_env,
+        screenshot,
+        exit_after,
+        view_only,
+        keylog,
+        native,
+        tunnel,
+    })
+}
+
+/// Prints saved connections. A GUI build has no console of its own, so attach the parent's.
+fn print_phone_book() {
+    unsafe {
+        let _ = windows::Win32::System::Console::AttachConsole(windows::Win32::System::Console::ATTACH_PARENT_PROCESS);
+    }
+    for c in config::load() {
+        let mode = if c.mode == config::Mode::Native { "native" } else { "rfb" };
+        let user = c.username.map(|u| format!(" {u}")).unwrap_or_default();
+        println!("{:16} {}:{} {mode}{user}", c.name, c.host, c.port);
+    }
 }
 
 fn main() {
@@ -105,6 +155,11 @@ fn run() -> Result<(), String> {
         }
     }
     if args.native {
+        if args.tunnel.is_some() {
+            return Err(
+                "the native path is QUIC/UDP and cannot use an SSH tunnel; use a Tailscale address directly".into()
+            );
+        }
         return native::run(&args);
     }
 
@@ -113,9 +168,21 @@ fn run() -> Result<(), String> {
         creds::delete(&target);
     }
 
+    // Optional SSH tunnel for the VNC path; kept alive for the whole session.
+    let _tunnel;
+    let (conn_host, conn_port) = if let Some(spec) = &args.tunnel {
+        let active = tunnel::open(spec, &args.host, args.port)?;
+        let local_port = active.local_port;
+        _tunnel = Some(active);
+        ("127.0.0.1".to_string(), local_port)
+    } else {
+        _tunnel = None;
+        (args.host.clone(), args.port)
+    };
+
     if let Some(var) = &args.password_env {
         let password = std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?;
-        let options = ConnectOptions::new(args.host.clone(), args.port, args.user.clone(), password);
+        let options = ConnectOptions::new(conn_host.clone(), conn_port, args.user.clone(), password);
         let session = aktivestream_rfb::connect(&options)
             .map_err(|e| format!("Could not connect to {}:{}\n\n{e}", args.host, args.port))?;
         return app::run(&args, session);
@@ -132,7 +199,7 @@ fn run() -> Result<(), String> {
             },
         };
         let username = (!login.user.is_empty()).then(|| login.user.clone());
-        let options = ConnectOptions::new(args.host.clone(), args.port, username, login.password.clone());
+        let options = ConnectOptions::new(conn_host.clone(), conn_port, username, login.password.clone());
         match aktivestream_rfb::connect(&options) {
             Ok(session) => {
                 if save {

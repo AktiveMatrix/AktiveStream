@@ -28,8 +28,9 @@ faster — the same approach other hardware-video remote desktops use — so Akt
 
 | Crate / component | Role |
 |---|---|
-| `aktivestream-win` | Windows client (`aktivestream.exe`): window, Direct3D 11, keyboard hook, VNC + native modes |
-| `aktivestream-linux` | Linux client (X11/Wayland): winit + softbuffer, VNC + native (ffmpeg decode) modes, connection phone book, SSH tunnel, full-screen toolbar |
+| `aktivestream-win` | Windows client (`aktivestream.exe`): window, Direct3D 11, keyboard hook, VNC + native modes, connection phone book, SSH tunnel |
+| `aktivestream-linux` | Linux client (X11/Wayland): winit + softbuffer, VNC + native (ffmpeg decode) modes, phone book, SSH tunnel, full-screen toolbar |
+| `aktivestream-client` | Shared, platform-neutral client logic: the connection phone book and SSH tunnel (so clients stay in parity) |
 | `aktivestream-proto` | Native transport: QUIC/TLS client, trust-on-first-use certificate pinning, wire messages |
 | `aktivestream-video` | Windows HEVC/H.264 decode via Media Foundation (NVDEC) |
 | `aktivestream-keymap` | PC-key → Mac-event engine and key-symbol translation (platform-neutral) |
@@ -48,13 +49,18 @@ cargo build --release          # produces target/release/aktivestream.exe
 cargo test --workspace
 ```
 
-**Linux client** (Rust; needs the GUI and ffmpeg dev packages):
+**Linux client** (Rust). The VNC client needs only the GUI dev packages; the native path is
+behind a `native` feature that pulls ffmpeg (bindings pinned to ffmpeg 8):
 
 ```sh
+# VNC client (works on any Linux):
 sudo apt install pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-  libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxcb-shm0-dev \
-  libva-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
-cargo build -p aktivestream-linux --release   # produces target/release/aktivestream
+  libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxcb-shm0-dev
+cargo build -p aktivestream-linux --release                     # target/release/aktivestream
+
+# Native QUIC + hardware-decode path (needs ffmpeg 8 dev libraries):
+sudo apt install libva-dev libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+cargo build -p aktivestream-linux --release --features native
 ```
 
 **Mac host agent** (Swift, macOS 14+):
@@ -70,27 +76,22 @@ granted once in System Settings — the same one-time grant any screen-capture t
 
 ## Usage
 
-```powershell
-# Native (QUIC + HEVC), connects to the host agent on UDP 35390:
-aktivestream.exe --native <mac-host>
-
-# VNC fallback, connects to macOS Screen Sharing on 5900:
-aktivestream.exe <mac-host>
-```
-
-On Linux the binary is `aktivestream` and takes the same arguments, plus a connection phone book
-and an SSH tunnel:
+The Windows binary is `aktivestream.exe`, the Linux binary is `aktivestream`; both take the same
+arguments:
 
 ```sh
-aktivestream --native <mac-host>         # native QUIC + hardware decode
-aktivestream <mac-host>                  # VNC fallback
-aktivestream --list                      # saved connections (~/.config/aktivestream/connections)
-aktivestream <saved-name>                # connect by saved name
-aktivestream --tunnel user@jump <mac>    # RFB through an SSH forward (off-LAN; Tailscale needs none)
+aktivestream --native <mac-host>         # native QUIC + hardware decode (UDP 35390)
+aktivestream <mac-host>                  # VNC fallback (macOS Screen Sharing, 5900)
+aktivestream --list                      # list saved connections (the phone book)
+aktivestream <saved-name>                # connect by a saved connection name
+aktivestream --tunnel user@jump <mac>    # VNC through an ssh -L forward (off-LAN; Tailscale needs none)
 ```
 
-In full screen, move the pointer to the top edge for a toolbar (connection name, leave full
-screen, disconnect).
+Saved connections live in `~/.config/aktivestream/connections` (or `%APPDATA%\aktivestream\connections`
+on Windows): one per line, `name  host  port  mode(rfb|native)  [user]  [tunnel=ssh]`.
+
+On the Linux client in full screen, move the pointer to the top edge for a toolbar (connection
+name, leave full screen, disconnect).
 
 ## Interoperability note
 
