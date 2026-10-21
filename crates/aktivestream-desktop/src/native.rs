@@ -16,7 +16,7 @@ use ffmpeg_next as ffmpeg;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use winit::event_loop::{EventLoop, EventLoopProxy};
 
-use crate::{App, Backend, Shared};
+use crate::{App, Backend, Session, Shared};
 
 /// Connects over QUIC, decodes the first video frame with ffmpeg, writes it to `path`, and exits.
 pub fn run_native_snapshot(host: String, password: String, path: String) -> Result<(), String> {
@@ -109,7 +109,8 @@ pub fn run_native(host: String, password: String, title: String) -> Result<(), S
         .map_err(|e| e.to_string())?;
 
     let backend = Backend::Native { tx: input_tx, translator: NativeInput::new() };
-    let mut app = App::new(shared, backend, title);
+    let session = Session { shared, backend, title, cursor_shape: None, _tunnel: None };
+    let mut app = App::new(vec![session]);
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
 }
 

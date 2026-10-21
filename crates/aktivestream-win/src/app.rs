@@ -9,6 +9,7 @@
 //! of `App` has been dropped.
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -63,6 +64,8 @@ const TIMER_EXIT: usize = 1;
 const LOCAL_FULLSCREEN: usize = 1;
 const LOCAL_TITLE: usize = 2;
 const LOCAL_DISCONNECT: usize = 3;
+const LOCAL_NEXT_SESSION: usize = 4;
+const LOCAL_PREV_SESSION: usize = 5;
 
 const BUTTON_LEFT: u8 = 1;
 const BUTTON_MIDDLE: u8 = 2;
@@ -169,12 +172,23 @@ fn scroll_px_from_env() -> f32 {
         .unwrap_or(160.0)
 }
 
+/// An inactive session's handle, kept so Right Ctrl + Left/Right can swap it into the active
+/// slot. The active session lives in the `App`'s own `shared`/`sink`/`name` fields, so all the
+/// single-session rendering, mouse and clipboard code keeps working against whichever is active.
+pub(crate) struct WinSession {
+    shared: Arc<Shared>,
+    sink: Sink,
+    name: String,
+}
+
 struct App {
     hwnd: HWND,
     hook_thread: u32,
     shared: Arc<Shared>,
     sink: Sink,
     name: String,
+    /// The other open sessions, in ring order (empty for a single session).
+    others: VecDeque<WinSession>,
     view: View,
     renderer: Option<Renderer>,
     buttons: u8,
@@ -275,6 +289,8 @@ fn on_key(ctx: &KeyCtx, hwnd: HWND, kb: &KBDLLHOOKSTRUCT, message: u32) -> bool 
         Some(LocalAction::ToggleFullscreen) => Some(LOCAL_FULLSCREEN),
         Some(LocalAction::ToggleSystemShortcuts) => Some(LOCAL_TITLE),
         Some(LocalAction::Disconnect) => Some(LOCAL_DISCONNECT),
+        Some(LocalAction::NextSession) => Some(LOCAL_NEXT_SESSION),
+        Some(LocalAction::PrevSession) => Some(LOCAL_PREV_SESSION),
         Some(LocalAction::PassChordToWindows) => {
             // Replayed from the hook thread's message loop, after this callback returns.
             let flags = usize::from(extended);
@@ -418,6 +434,27 @@ impl App {
             let _ = GetClientRect(self.hwnd, &mut client);
         }
         (client.right - client.left, client.bottom - client.top)
+    }
+
+    /// Swaps the active session with the next (`delta >= 0`) or previous one in the ring; returns
+    /// the new active session's name, or `None` when there is only one session.
+    fn switch(&mut self, delta: isize) -> Option<String> {
+        if self.others.is_empty() {
+            return None;
+        }
+        let current = WinSession { shared: self.shared.clone(), sink: self.sink.clone(), name: self.name.clone() };
+        let next = if delta >= 0 {
+            self.others.push_back(current);
+            self.others.pop_front()
+        } else {
+            self.others.push_front(current);
+            self.others.pop_back()
+        }
+        .expect("others is non-empty");
+        self.shared = next.shared;
+        self.sink = next.sink;
+        self.name = next.name.clone();
+        Some(next.name)
     }
 
     fn update_view(&mut self) {
@@ -697,6 +734,21 @@ fn size_window(hwnd: HWND, fb_w: u32, fb_h: u32) {
     }
 }
 
+/// Cycles the active session (Right Ctrl + Left/Right): releases held input on the one being left,
+/// swaps the next into the active slot, repoints the keyboard sink, retitles, and repaints.
+fn switch_session(hwnd: HWND, delta: isize) {
+    with_app(App::release_all);
+    let new_sink = with_app(|app| app.switch(delta).map(|_| app.sink.clone()));
+    if let Some(Some(sink)) = new_sink {
+        keys().sink = sink;
+        with_app(App::update_view);
+        update_title(hwnd);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+}
+
 fn update_title(hwnd: HWND) {
     if let Some(title) = with_app(|app| app.title()) {
         unsafe {
@@ -956,6 +1008,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             match wparam.0 {
                 LOCAL_FULLSCREEN => toggle_fullscreen(hwnd),
                 LOCAL_TITLE => update_title(hwnd),
+                LOCAL_NEXT_SESSION => switch_session(hwnd, 1),
+                LOCAL_PREV_SESSION => switch_session(hwnd, -1),
                 LOCAL_DISCONNECT => {
                     CLOSED_BY_USER.set(true);
                     unsafe {
@@ -1000,9 +1054,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
 pub fn run(args: &Args, session: (ServerInfo, SessionReader, SessionWriter)) -> Result<(), String> {
     let (info, reader, writer) = session;
     let shared = Arc::new(Shared::new(info.width, info.height));
-    run_window(args, shared, info.name, Backend::Rfb, move |shared, rx| {
+    run_window(args, shared, info.name, Backend::Rfb, Vec::new(), move |shared, rx| {
         net::spawn_reader(shared.clone(), reader);
         net::spawn_writer(shared, writer, rx);
+    })
+}
+
+/// Opens multiple RFB sessions in one window; the first is active and the rest cycle in with
+/// Right Ctrl + Left/Right. Each gets its own reader and writer threads.
+pub fn run_multi(
+    args: &Args,
+    sessions: Vec<(String, (ServerInfo, SessionReader, SessionWriter))>,
+) -> Result<(), String> {
+    let mut sessions = sessions.into_iter();
+    let (active_name, (active_info, active_reader, active_writer)) = sessions.next().ok_or("no sessions to open")?;
+    let active_shared = Arc::new(Shared::new(active_info.width, active_info.height));
+
+    let mut others = Vec::new();
+    for (name, (info, reader, writer)) in sessions {
+        let shared = Arc::new(Shared::new(info.width, info.height));
+        let (tx, rx) = mpsc::channel();
+        net::spawn_reader(shared.clone(), reader);
+        net::spawn_writer(shared.clone(), writer, rx);
+        others.push(WinSession { shared, sink: Sink::Rfb(tx), name });
+    }
+
+    run_window(args, active_shared, active_name, Backend::Rfb, others, move |shared, rx| {
+        net::spawn_reader(shared.clone(), active_reader);
+        net::spawn_writer(shared, active_writer, rx);
     })
 }
 
@@ -1014,6 +1093,7 @@ pub fn run_window(
     shared: Arc<Shared>,
     host_name: String,
     backend: Backend,
+    others: Vec<WinSession>,
     start_source: impl FnOnce(Arc<Shared>, mpsc::Receiver<Out>),
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
@@ -1058,6 +1138,9 @@ pub fn run_window(
     };
     size_window(hwnd, fb_w, fb_h);
     shared.set_hwnd(hwnd);
+    for other in &others {
+        other.shared.set_hwnd(hwnd);
+    }
 
     let keylog = match &args.keylog {
         Some(path) => Some(std::io::BufWriter::new(
@@ -1093,6 +1176,7 @@ pub fn run_window(
         shared: shared.clone(),
         sink,
         name: host_name,
+        others: others.into(),
         view: View::default(),
         renderer,
         buttons: 0,

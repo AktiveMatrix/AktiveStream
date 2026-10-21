@@ -35,6 +35,8 @@ diagnostics:\n\
 
 pub struct Args {
     pub host: String,
+    /// Additional targets (raw, unresolved) to open as extra switchable sessions.
+    pub extra_hosts: Vec<String>,
     pub port: u16,
     pub user: Option<String>,
     pub fullscreen: bool,
@@ -50,6 +52,7 @@ pub struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut host = None;
+    let mut extra_hosts = Vec::new();
     let mut user = None;
     let mut fullscreen = false;
     let mut forget = false;
@@ -81,7 +84,8 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => return Err(USAGE.to_string()),
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
             _ if host.is_none() => host = Some(arg),
-            _ => return Err(format!("unexpected argument {arg}\n\n{USAGE}")),
+            // Additional hosts open as extra switchable sessions (RFB only).
+            _ => extra_hosts.push(arg),
         }
     }
     if list {
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
     let tunnel = tunnel.or(saved_tunnel);
     Ok(Args {
         host,
+        extra_hosts,
         port,
         user,
         fullscreen,
@@ -160,6 +165,9 @@ fn run() -> Result<(), String> {
         }
     }
     if args.native {
+        if !args.extra_hosts.is_empty() {
+            return Err("multi-session is RFB only; open native connections one at a time".into());
+        }
         if args.tunnel.is_some() {
             return Err(
                 "the native path is QUIC/UDP and cannot use an SSH tunnel; use a Tailscale address directly".into()
@@ -185,36 +193,78 @@ fn run() -> Result<(), String> {
         (args.host.clone(), args.port)
     };
 
-    if let Some(var) = &args.password_env {
+    // Connect the first target, capturing the login (user, password) to reuse for extra sessions.
+    let (session, username, password) = if let Some(var) = &args.password_env {
         let password = std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?;
-        let options = ConnectOptions::new(conn_host.clone(), conn_port, args.user.clone(), password);
+        let options = ConnectOptions::new(conn_host.clone(), conn_port, args.user.clone(), password.clone());
         let session = aktivestream_rfb::connect(&options)
             .map_err(|e| format!("Could not connect to {}:{}\n\n{e}", args.host, args.port))?;
+        (session, args.user.clone(), password)
+    } else {
+        let mut saved = creds::read(&target);
+        let mut auth_error = 0;
+        loop {
+            let (login, save) = match saved.take() {
+                Some(login) => (login, false),
+                None => match creds::prompt(&target, &args.host, args.user.as_deref(), auth_error)? {
+                    Some(answer) => answer,
+                    None => return Ok(()),
+                },
+            };
+            let username = (!login.user.is_empty()).then(|| login.user.clone());
+            let options = ConnectOptions::new(conn_host.clone(), conn_port, username.clone(), login.password.clone());
+            match aktivestream_rfb::connect(&options) {
+                Ok(session) => {
+                    if save {
+                        creds::write(&target, &login.user, &login.password);
+                    }
+                    break (session, username, login.password);
+                }
+                Err(RfbError::AuthFailed(_) | RfbError::UsernameRequired(_)) => auth_error = ERROR_LOGON_FAILURE.0,
+                Err(e) => return Err(format!("Could not connect to {}:{}\n\n{e}", args.host, args.port)),
+            }
+        }
+    };
+
+    if args.extra_hosts.is_empty() {
         return app::run(&args, session);
     }
 
-    let mut saved = creds::read(&target);
-    let mut auth_error = 0;
-    let session = loop {
-        let (login, save) = match saved.take() {
-            Some(login) => (login, false),
-            None => match creds::prompt(&target, &args.host, args.user.as_deref(), auth_error)? {
-                Some(answer) => answer,
-                None => return Ok(()),
-            },
+    // Multi-session: connect each extra target (reusing the first login) and open them together.
+    // The tunnels must outlive the window, so keep them in scope for the whole call.
+    let mut _extra_tunnels = Vec::new();
+    let mut sessions = vec![(args.host.clone(), session)];
+    for extra in &args.extra_hosts {
+        let (h, p, tun) = resolve_rfb_target(extra)?;
+        let (eh, ep) = if let Some(spec) = &tun {
+            let active = tunnel::open(spec, &h, p)?;
+            let local_port = active.local_port;
+            _extra_tunnels.push(active);
+            ("127.0.0.1".to_string(), local_port)
+        } else {
+            (h, p)
         };
-        let username = (!login.user.is_empty()).then(|| login.user.clone());
-        let options = ConnectOptions::new(conn_host.clone(), conn_port, username, login.password.clone());
-        match aktivestream_rfb::connect(&options) {
-            Ok(session) => {
-                if save {
-                    creds::write(&target, &login.user, &login.password);
-                }
-                break session;
-            }
-            Err(RfbError::AuthFailed(_) | RfbError::UsernameRequired(_)) => auth_error = ERROR_LOGON_FAILURE.0,
-            Err(e) => return Err(format!("Could not connect to {}:{}\n\n{e}", args.host, args.port)),
+        let options = ConnectOptions::new(eh, ep, username.clone(), password.clone());
+        let session =
+            aktivestream_rfb::connect(&options).map_err(|e| format!("Could not connect to {extra}\n\n{e}"))?;
+        sessions.push((extra.clone(), session));
+    }
+    app::run_multi(&args, sessions)
+}
+
+/// Resolves an extra RFB target (a saved name or `host[:port]`) to (host, port, tunnel). Rejects a
+/// native saved connection, since multi-session is RFB only.
+fn resolve_rfb_target(target: &str) -> Result<(String, u16, Option<String>), String> {
+    match config::find(target) {
+        Some(c) if c.mode == config::Mode::Native => {
+            Err(format!("{target} is a native connection; multi-session is RFB only"))
         }
-    };
-    app::run(&args, session)
+        Some(c) => Ok((c.host, c.port, c.tunnel)),
+        None => match target.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => {
+                Ok((h.to_string(), p.parse().map_err(|_| format!("bad port in {target}"))?, None))
+            }
+            _ => Ok((target.to_string(), 5900, None)),
+        },
+    }
 }

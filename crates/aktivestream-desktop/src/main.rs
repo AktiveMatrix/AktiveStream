@@ -68,9 +68,10 @@ impl Shared {
 
 /// Pulls updates forever, applying each to the shared framebuffer and waking the UI thread. The
 /// reader itself re-requests the next update, so this never touches the writer.
-fn run_reader(shared: Arc<Shared>, proxy: EventLoopProxy<()>, mut reader: SessionReader) {
-    // Clipboard owner for Mac -> Linux pushes; absent if there is no display to serve it.
-    let mut clipboard = arboard::Clipboard::new().ok();
+fn run_reader(shared: Arc<Shared>, proxy: EventLoopProxy<()>, mut reader: SessionReader, clipboard_enabled: bool) {
+    // Clipboard owner for Mac -> Linux pushes; only one session owns the clipboard, and only if
+    // there is a display to serve it.
+    let mut clipboard = if clipboard_enabled { arboard::Clipboard::new().ok() } else { None };
     loop {
         match reader.next_event(&shared.framebuffer) {
             Ok(ServerEvent::Update { .. } | ServerEvent::Resized { .. }) => {
@@ -136,10 +137,31 @@ fn run_clipboard_poller(shared: Arc<Shared>, mut writer: SessionWriter) {
     }
 }
 
-struct App {
+/// One open connection: its framebuffer, how input reaches it, a title, the last cursor shape it
+/// sent, and (RFB) the SSH tunnel kept alive for the session's lifetime.
+struct Session {
     shared: Arc<Shared>,
     backend: Backend,
     title: String,
+    cursor_shape: Option<CursorShape>,
+    _tunnel: Option<tunnel::Tunnel>,
+}
+
+impl Session {
+    /// A clone of the RFB writer (for the clipboard poller), or `None` for the native backend.
+    fn rfb_writer(&self) -> Option<SessionWriter> {
+        match &self.backend {
+            Backend::Rfb { writer, .. } => Some(writer.clone()),
+            Backend::Native { .. } => None,
+        }
+    }
+}
+
+struct App {
+    /// The open sessions; `active` is the one shown in the window and receiving input. Right Ctrl
+    /// + Left/Right cycles between them.
+    sessions: Vec<Session>,
+    active: usize,
     engine: Engine,
     buttons: u8,
     pointer: (u16, u16),
@@ -149,8 +171,6 @@ struct App {
     bar_shown: bool,
     /// Pixels per wheel notch for the native path (AKTIVESTREAM_SCROLL), as on Windows.
     scroll_px: f32,
-    /// The remote cursor shape currently applied, kept so it can be rescaled on window resize.
-    cursor_shape: Option<CursorShape>,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -200,11 +220,10 @@ fn button_bit(button: MouseButton) -> u8 {
 }
 
 impl App {
-    fn new(shared: Arc<Shared>, backend: Backend, title: String) -> Self {
+    fn new(sessions: Vec<Session>) -> Self {
         App {
-            shared,
-            backend,
-            title,
+            sessions,
+            active: 0,
             engine: Engine::new(default_profile()),
             buttons: 0,
             pointer: (0, 0),
@@ -213,20 +232,40 @@ impl App {
             fullscreen: false,
             bar_shown: false,
             scroll_px: scroll_px_from_env(),
-            cursor_shape: None,
             window: None,
             surface: None,
         }
     }
 
+    /// Cycles to the next (`delta` = 1) or previous (-1) session: releases keys and buttons on the
+    /// one being left, then shows and starts driving the new one.
+    fn switch(&mut self, delta: isize, event_loop: &ActiveEventLoop) {
+        if self.sessions.len() < 2 {
+            return;
+        }
+        self.release_all();
+        let n = self.sessions.len() as isize;
+        self.active = (((self.active as isize + delta) % n + n) % n) as usize;
+        if let Some(window) = &self.window {
+            window.set_title(&format!(
+                "{} - AktiveStream ({}/{})",
+                self.sessions[self.active].title,
+                self.active + 1,
+                n
+            ));
+            window.request_redraw();
+        }
+        self.apply_cursor(event_loop);
+    }
+
     /// Builds and applies the remote cursor at the current framebuffer-to-window scale (the Mac's
     /// cursor shape, so I-beams, resize arrows and the like match what the Mac shows).
     fn apply_cursor(&self, event_loop: &ActiveEventLoop) {
-        let (Some(shape), Some(window)) = (&self.cursor_shape, &self.window) else {
+        let (Some(shape), Some(window)) = (&self.sessions[self.active].cursor_shape, &self.window) else {
             return;
         };
         let dw = f64::from(window.inner_size().width);
-        let sw = f64::from(self.shared.framebuffer.lock().unwrap().width);
+        let sw = f64::from(self.sessions[self.active].shared.framebuffer.lock().unwrap().width);
         let scale = if sw > 0.0 { dw / sw } else { 1.0 };
         let Some((rgba, w, h, hx, hy)) = scaled_cursor_rgba(shape, scale) else {
             return;
@@ -252,7 +291,7 @@ impl App {
         let Ok(mut buffer) = surface.buffer_mut() else { return };
         let (dw, dh) = (dw.get() as usize, dh.get() as usize);
 
-        let fb = self.shared.framebuffer.lock().unwrap();
+        let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
         let (sw, sh) = (fb.width as usize, fb.height as usize);
         if sw == 0 || sh == 0 {
             buffer.fill(0);
@@ -267,14 +306,15 @@ impl App {
         }
         drop(fb);
         if self.fullscreen && self.bar_shown {
-            bar::draw_bar(&mut buffer, dw, dh, bar::bar_action_at(self.cursor, dw), &self.title);
+            let title = &self.sessions[self.active].title;
+            bar::draw_bar(&mut buffer, dw, dh, bar::bar_action_at(self.cursor, dw), title);
         }
         let _ = buffer.present();
     }
 
     fn send_host_events(&mut self, events: Vec<HostEvent>) {
         let caps = self.caps;
-        match &mut self.backend {
+        match &mut self.sessions[self.active].backend {
             Backend::Rfb { writer, translator } => {
                 translator.set_caps_lock(caps);
                 for event in events {
@@ -304,6 +344,8 @@ impl App {
         match output.local {
             Some(LocalAction::ToggleFullscreen) => self.toggle_fullscreen(),
             Some(LocalAction::Disconnect) => event_loop.exit(),
+            Some(LocalAction::NextSession) => self.switch(1, event_loop),
+            Some(LocalAction::PrevSession) => self.switch(-1, event_loop),
             _ => {}
         }
         self.send_host_events(output.host);
@@ -323,7 +365,7 @@ impl App {
 
     fn to_framebuffer(&self, x: f64, y: f64) -> (u16, u16) {
         let size = self.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
-        let fb = self.shared.framebuffer.lock().unwrap();
+        let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
         let (sw, sh) = (fb.width.max(1), fb.height.max(1));
         let fx = (x.max(0.0) as u32 * sw / size.width.max(1)).min(sw - 1);
         let fy = (y.max(0.0) as u32 * sh / size.height.max(1)).min(sh - 1);
@@ -334,10 +376,10 @@ impl App {
         let (x, y) = self.pointer;
         let buttons = self.buttons;
         let (fw, fh) = {
-            let fb = self.shared.framebuffer.lock().unwrap();
+            let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
             (fb.width.max(1) as f32, fb.height.max(1) as f32)
         };
-        match &mut self.backend {
+        match &mut self.sessions[self.active].backend {
             Backend::Rfb { writer, .. } => {
                 let _ = writer.pointer_event(buttons, x, y);
             }
@@ -411,7 +453,7 @@ impl App {
         };
         let (x, y) = self.pointer;
         let buttons = self.buttons;
-        match &mut self.backend {
+        match &mut self.sessions[self.active].backend {
             Backend::Rfb { writer, .. } => {
                 let (bit, count) = if notches >= 0 { (WHEEL_UP, notches) } else { (WHEEL_DOWN, -notches) };
                 for _ in 0..count {
@@ -502,13 +544,24 @@ impl ApplicationHandler<()> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
-        if let Some(error) = self.shared.error.lock().unwrap().take() {
-            eprintln!("{error}");
-            event_loop.exit();
-            return;
+        // Surface any session's error (for now one failed session ends the app).
+        for s in &self.sessions {
+            if let Some(error) = s.shared.error.lock().unwrap().take() {
+                eprintln!("{error}");
+                event_loop.exit();
+                return;
+            }
         }
-        if let Some(shape) = self.shared.cursor.lock().unwrap().take() {
-            self.cursor_shape = Some(shape);
+        // Keep each session's cursor shape current; apply the active one's.
+        let active = self.active;
+        let mut active_changed = false;
+        for (i, s) in self.sessions.iter_mut().enumerate() {
+            if let Some(shape) = s.shared.cursor.lock().unwrap().take() {
+                s.cursor_shape = Some(shape);
+                active_changed |= i == active;
+            }
+        }
+        if active_changed {
             self.apply_cursor(event_loop);
         }
         if let Some(window) = &self.window {
@@ -831,18 +884,37 @@ fn main() -> Result<(), String> {
     if native_flag {
         args.remove(0);
     }
-    let Some(target) = args.first().cloned() else {
-        // No target given: show the connection picker, which launches the chosen connection.
+    if args.is_empty() {
+        // No target: show the connection picker, which launches the chosen connection.
         return run_picker(config::load());
-    };
-    let title = target.clone();
-    let port_arg: Option<u16> = args.get(1).and_then(|p| p.parse().ok());
+    }
+    // Multiple targets open together as switchable sessions (RFB only; Right Ctrl + Left/Right
+    // cycles between them).
+    if args.len() > 1 {
+        if native_flag {
+            return Err("multi-session is RFB only; drop --native and pass RFB hosts".into());
+        }
+        let mut built = Vec::new();
+        for target in &args {
+            built.push(connect_rfb(target, &tunnel_flag)?);
+        }
+        return run_sessions(built);
+    }
 
-    // Resolve a saved connection by name; otherwise treat the argument as a host address.
+    // Single target: the native path, a headless test mode, or one RFB session. A `host:port`
+    // argument sets the port; a saved name carries its own.
+    let target = args[0].clone();
+    let title = target.clone();
     let saved = config::find(&target);
-    let host = saved.as_ref().map_or(target, |c| c.host.clone());
+    let (host, host_port) = match &saved {
+        Some(c) => (c.host.clone(), Some(c.port)),
+        None => match target.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().ok()),
+            _ => (target.clone(), None),
+        },
+    };
     let use_native = native_flag || saved.as_ref().is_some_and(|c| c.mode == config::Mode::Native);
-    let port = port_arg.or(saved.as_ref().map(|c| c.port)).unwrap_or(if use_native { 35390 } else { 5900 });
+    let port = host_port.unwrap_or(if use_native { 35390 } else { 5900 });
     let saved_user = saved.as_ref().and_then(|c| c.username.clone());
     let tunnel = tunnel_flag.or_else(|| saved.and_then(|c| c.tunnel));
 
@@ -880,52 +952,105 @@ fn main() -> Result<(), String> {
         );
     }
 
-    // RFB path, optionally through an SSH tunnel. Keep the tunnel alive for the whole session.
-    let _tunnel: Option<tunnel::Tunnel>;
+    // RFB path, optionally through an SSH tunnel. Keep the tunnel alive for the session.
+    let tunnel_guard: Option<tunnel::Tunnel>;
     let (rfb_host, rfb_port) = if let Some(spec) = &tunnel {
         let active = tunnel::open(spec, &host, port)?;
         let local_port = active.local_port;
-        _tunnel = Some(active);
+        tunnel_guard = Some(active);
         ("127.0.0.1".to_string(), local_port)
     } else {
-        _tunnel = None;
+        tunnel_guard = None;
         (host, port)
     };
     let username = saved_user.or_else(|| std::env::var("RFB_USER").ok());
     let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
     let options = ConnectOptions::new(rfb_host, rfb_port, username, password);
 
-    // Headless verification: decode the first frame to a PNG and exit, no display server needed.
+    // Headless verification modes (single session only).
     if let Ok(path) = std::env::var("AKTIVE_SNAPSHOT") {
         return run_snapshot(options, &path);
     }
-    // Headless input check: move the remote pointer to known framebuffer coordinates, so a
-    // watcher on the Mac can confirm the client->host input channel over RFB.
     if std::env::var("AKTIVE_INPUT_TEST").is_ok() {
         return run_input_test(options);
     }
 
     let (info, reader, writer) = connect(&options).map_err(|e| format!("connect: {e}"))?;
     eprintln!("connected to {} ({}x{})", info.name, info.width, info.height);
-    let shared = Arc::new(Shared::new(info.width as u32, info.height as u32));
+    let session = Session {
+        shared: Arc::new(Shared::new(info.width as u32, info.height as u32)),
+        backend: Backend::Rfb { writer, translator: RfbTranslator::new() },
+        title,
+        cursor_shape: None,
+        _tunnel: tunnel_guard,
+    };
+    run_sessions(vec![(session, reader)])
+}
 
+/// Resolves an RFB target (saved name or `host[:port]`, optionally through an SSH tunnel) and
+/// connects. For the multi-session path; the native path stays single-session.
+fn connect_rfb(target: &str, tunnel_flag: &Option<String>) -> Result<(Session, SessionReader), String> {
+    let saved = config::find(target);
+    if saved.as_ref().is_some_and(|c| c.mode == config::Mode::Native) {
+        return Err(format!("{target} is a native connection; multi-session is RFB only"));
+    }
+    let (host, port) = match &saved {
+        Some(c) => (c.host.clone(), c.port),
+        None => match target.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok() => (h.to_string(), p.parse().unwrap()),
+            _ => (target.to_string(), 5900),
+        },
+    };
+    let username = saved.as_ref().and_then(|c| c.username.clone()).or_else(|| std::env::var("RFB_USER").ok());
+    let tunnel = tunnel_flag.clone().or_else(|| saved.and_then(|c| c.tunnel));
+    let tunnel_guard: Option<tunnel::Tunnel>;
+    let (rfb_host, rfb_port) = if let Some(spec) = &tunnel {
+        let active = tunnel::open(spec, &host, port)?;
+        let local_port = active.local_port;
+        tunnel_guard = Some(active);
+        ("127.0.0.1".to_string(), local_port)
+    } else {
+        tunnel_guard = None;
+        (host, port)
+    };
+    let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
+    let options = ConnectOptions::new(rfb_host, rfb_port, username, password);
+    let (info, reader, writer) = connect(&options).map_err(|e| format!("connect {target}: {e}"))?;
+    eprintln!("connected to {} ({}x{})", info.name, info.width, info.height);
+    let session = Session {
+        shared: Arc::new(Shared::new(info.width as u32, info.height as u32)),
+        backend: Backend::Rfb { writer, translator: RfbTranslator::new() },
+        title: target.to_string(),
+        cursor_shape: None,
+        _tunnel: tunnel_guard,
+    };
+    Ok((session, reader))
+}
+
+/// Runs the window over one or more sessions: spawns a reader thread per session (only the first
+/// owns the clipboard), and a clipboard poller for the first, then drives the event loop.
+fn run_sessions(built: Vec<(Session, SessionReader)>) -> Result<(), String> {
     let event_loop = EventLoop::<()>::with_user_event().build().map_err(|e| e.to_string())?;
     let proxy = event_loop.create_proxy();
-    let reader_shared = shared.clone();
-    thread::Builder::new()
-        .name("rfb-reader".into())
-        .spawn(move || run_reader(reader_shared, proxy, reader))
-        .map_err(|e| e.to_string())?;
-
-    // Forward local clipboard changes to the Mac on a side channel (clone shares the write lock).
-    let clip_shared = shared.clone();
-    let clip_writer = writer.clone();
-    thread::Builder::new()
-        .name("clipboard".into())
-        .spawn(move || run_clipboard_poller(clip_shared, clip_writer))
-        .map_err(|e| e.to_string())?;
-
-    let mut app = App::new(shared, Backend::Rfb { writer, translator: RfbTranslator::new() }, title);
+    let mut sessions = Vec::with_capacity(built.len());
+    for (i, (session, reader)) in built.into_iter().enumerate() {
+        let clipboard = i == 0;
+        if clipboard && let Some(writer) = session.rfb_writer() {
+            let shared = session.shared.clone();
+            thread::Builder::new()
+                .name("clipboard".into())
+                .spawn(move || run_clipboard_poller(shared, writer))
+                .map_err(|e| e.to_string())?;
+        }
+        let shared = session.shared.clone();
+        let proxy = proxy.clone();
+        thread::Builder::new()
+            .name("rfb-reader".into())
+            .spawn(move || run_reader(shared, proxy, reader, clipboard))
+            .map_err(|e| e.to_string())?;
+        sessions.push(session);
+    }
+    let mut app = App::new(sessions);
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
 }
 

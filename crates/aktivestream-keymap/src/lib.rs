@@ -195,6 +195,10 @@ pub enum LocalAction {
     ToggleFullscreen,
     ToggleSystemShortcuts,
     Disconnect,
+    /// Cycle to the next / previous open session (Right Ctrl + Right / Left). The client switches
+    /// which session its window shows and sends input to; the Mac never sees these.
+    NextSession,
+    PrevSession,
     /// Hand the key just pressed to Windows together with a Win key (one of
     /// [`Profile::windows_chords`] while the Win key itself is going to the host). The
     /// platform layer replays Win + this key to Windows; the engine has already consumed
@@ -244,9 +248,9 @@ pub struct Profile {
 }
 
 impl Profile {
-    /// the macOS keyboard profile (Left Ctrl = Command, Right Ctrl = Control,
-    /// see docs/keyboard-profile.md):
-    /// Alt = Option, Win = Command, plus its default key conversions and Jump shortcuts.
+    /// The built-in PC-to-Mac "macOS" keyboard profile (see docs/keyboard-profile.md): Left Ctrl =
+    /// Command, Right Ctrl = Control, Alt = Option, Win = Command, plus its default key conversions
+    /// and client shortcuts.
     pub fn mac_default() -> Profile {
         profile::mac_default()
     }

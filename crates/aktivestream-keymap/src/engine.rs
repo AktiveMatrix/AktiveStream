@@ -158,6 +158,19 @@ impl State {
         if let Some(&sent) = self.held.get(&key) {
             return output(Disposition::Consume, vec![HostEvent::Key { key: sent, down: true }]);
         }
+        // Right Ctrl is the session-switch leader: Right Ctrl + Left/Right cycles open sessions on
+        // the client without reaching the Mac (Left Ctrl keeps its normal host mapping).
+        if self.modifiers.contains_key(&Key::RCtrl) {
+            let switch = match key {
+                Key::Left => Some(LocalAction::PrevSession),
+                Key::Right => Some(LocalAction::NextSession),
+                _ => None,
+            };
+            if let Some(action) = switch {
+                self.local_keys.insert(key);
+                return Output { disposition: Disposition::Consume, host: Vec::new(), local: Some(action) };
+            }
+        }
         let mods = self.phys_mods();
         if !self.system_shortcuts_to_host(profile) && self.is_system_shortcut(key, mods) {
             self.passed_keys.insert(key);
@@ -548,6 +561,20 @@ mod tests {
         let out = down(&mut e, Key::W);
         assert_eq!(out.local, Some(LocalAction::Disconnect));
         assert!(out.host.is_empty());
+    }
+
+    #[test]
+    fn right_ctrl_cycles_sessions() {
+        let mut e = engine();
+        down(&mut e, Key::RCtrl); // the switch leader (also Control on the host)
+        let next = down(&mut e, Key::Right);
+        assert_eq!(next.local, Some(LocalAction::NextSession));
+        assert!(next.host.is_empty(), "the switch never reaches the Mac");
+        assert_eq!(down(&mut e, Key::Left).local, Some(LocalAction::PrevSession));
+        // Left Ctrl keeps its normal host mapping, so it is not the switch leader.
+        let mut e2 = engine();
+        down(&mut e2, Key::LCtrl);
+        assert_eq!(down(&mut e2, Key::Left).local, None, "Left Ctrl is not the switch leader");
     }
 
     #[test]

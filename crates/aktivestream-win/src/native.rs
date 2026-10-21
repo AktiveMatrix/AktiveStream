@@ -46,7 +46,7 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let (w, h, name) = info_rx.recv().map_err(|_| "native connection failed".to_string())??;
     let shared = Arc::new(Shared::new(w.min(u16::MAX.into()) as u16, h.min(u16::MAX.into()) as u16));
-    app::run_window(args, shared, name, Backend::Native(input_tx), move |shared, _rx| {
+    app::run_window(args, shared, name, Backend::Native(input_tx), Vec::new(), move |shared, _rx| {
         let _ = shared_tx.send(shared);
     })
 }
