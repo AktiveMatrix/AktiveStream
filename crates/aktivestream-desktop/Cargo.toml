@@ -33,5 +33,11 @@ arboard = { version = "3", default-features = false }
 # native path with `--features native` on a Linux box that has ffmpeg's dev libraries.
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 
+# macOS event tap: capture system keyboard shortcuts (Cmd+Tab) that winit never receives and
+# forward them to the remote Mac. Same major versions winit/softbuffer already pull in on macOS.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+core-foundation = "0.9"
+
 [features]
 native = ["dep:ffmpeg-next"]

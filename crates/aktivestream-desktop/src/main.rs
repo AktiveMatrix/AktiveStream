@@ -6,12 +6,15 @@
 //!
 //! Usage: aktivestream <host> [port]   (env RFB_USER, RFB_PASSWORD)
 
+#[cfg(target_os = "macos")]
+mod event_tap;
 mod keys;
 #[cfg(feature = "native")]
 mod native;
 
 use aktivestream_client::{bar, config, picker, tunnel};
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::process::Command;
 use std::rc::Rc;
@@ -157,6 +160,10 @@ impl Session {
     }
 }
 
+/// System shortcuts (e.g. Cmd+Tab) captured by the macOS event tap, queued for the UI thread to
+/// feed through the engine. Stays empty on platforms without the tap.
+type SystemKeys = Arc<Mutex<VecDeque<(aktivestream_keymap::Key, bool)>>>;
+
 struct App {
     /// The open sessions; `active` is the one shown in the window and receiving input. Right Ctrl
     /// + Left/Right cycles between them.
@@ -171,6 +178,8 @@ struct App {
     bar_shown: bool,
     /// Pixels per wheel notch for the native path (AKTIVESTREAM_SCROLL), as on Windows.
     scroll_px: f32,
+    /// System shortcuts from the macOS event tap, drained on each UI wake-up.
+    system_keys: SystemKeys,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
 }
@@ -232,6 +241,7 @@ impl App {
             fullscreen: false,
             bar_shown: false,
             scroll_px: scroll_px_from_env(),
+            system_keys: Arc::new(Mutex::new(VecDeque::new())),
             window: None,
             surface: None,
         }
@@ -335,8 +345,12 @@ impl App {
 
     fn on_key(&mut self, event: KeyEvent, event_loop: &ActiveEventLoop) {
         let PhysicalKey::Code(code) = event.physical_key else { return };
-        let key = keys::to_key(code);
-        let down = event.state == ElementState::Pressed;
+        self.feed_key(keys::to_key(code), event.state == ElementState::Pressed, event_loop);
+    }
+
+    /// Runs one key transition through the engine and acts on it: local shortcuts here, host key
+    /// events to the active session. Shared by the winit keyboard and the macOS event tap.
+    fn feed_key(&mut self, key: aktivestream_keymap::Key, down: bool, event_loop: &ActiveEventLoop) {
         if key == aktivestream_keymap::Key::CapsLock && down {
             self.caps = !self.caps;
         }
@@ -544,6 +558,12 @@ impl ApplicationHandler<()> for App {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
+        // System shortcuts captured by the macOS event tap (e.g. Cmd+Tab), fed through the engine
+        // like any other key so the active session's Mac receives them.
+        let captured: Vec<_> = { self.system_keys.lock().unwrap().drain(..).collect() };
+        for (key, down) in captured {
+            self.feed_key(key, down, event_loop);
+        }
         // Surface any session's error (for now one failed session ends the app).
         for s in &self.sessions {
             if let Some(error) = s.shared.error.lock().unwrap().take() {
@@ -1051,6 +1071,9 @@ fn run_sessions(built: Vec<(Session, SessionReader)>) -> Result<(), String> {
         sessions.push(session);
     }
     let mut app = App::new(sessions);
+    // macOS: capture system shortcuts (Cmd+Tab) that winit never sees and forward them to the Mac.
+    #[cfg(target_os = "macos")]
+    event_tap::spawn(proxy.clone(), app.system_keys.clone());
     event_loop.run_app(&mut app).map_err(|e| e.to_string())
 }
 

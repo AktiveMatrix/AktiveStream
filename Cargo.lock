@@ -73,6 +73,8 @@ dependencies = [
  "aktivestream-proto",
  "aktivestream-rfb",
  "arboard",
+ "core-foundation",
+ "core-graphics",
  "env_logger",
  "ffmpeg-next",
  "png",
