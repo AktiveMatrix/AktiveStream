@@ -2,6 +2,8 @@
 // it to the AktiveStream client over QUIC, injecting input and syncing the clipboard in the
 // user's GUI session. See docs/phase2-protocol.md. This file is the entry point; the pieces
 // land in sibling files as the agent grows.
+import CoreGraphics
+import CVirtualDisplay
 import Foundation
 import Network
 import ScreenCaptureKit
@@ -27,7 +29,29 @@ func preflight() {
     }
 }
 
+// On a headless / clamshell Mac the built-in display is off and the window server has no active
+// display, so nothing is composited for capture. Creating a software virtual display gives the
+// window server an active display and keeps the desktop composited on the main display, which the
+// framebuffer capture path then grabs. A no-op when a display is already active (lid open, external
+// attached, or a virtual display left by a previous run).
+func ensureDisplay() {
+    var count: UInt32 = 0
+    CGGetActiveDisplayList(0, nil, &count)
+    if count > 0 {
+        log("display: \(count) display(s) already active; not creating a virtual one")
+        return
+    }
+    let vid = aktive_virtual_display_create(1920, 1200, 60)
+    if vid != 0 {
+        log("display: created 1920x1200 virtual display to keep the desktop composited (id \(vid))")
+        Thread.sleep(forTimeInterval: 1.0)
+    } else {
+        log("display: could not create a virtual display (CGVirtualDisplay unavailable)")
+    }
+}
+
 func serve(port: UInt16) {
+    ensureDisplay()
     do {
         let identity = try loadOrCreateIdentity()
         let listener = HostListener(identity: identity, port: port)

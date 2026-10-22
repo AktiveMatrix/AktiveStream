@@ -1,6 +1,7 @@
 // One client session over a QUIC stream: message framing, the handshake, and (checkpoint 1b)
 // a synthetic test frame. Framing matches crates/aktivestream-proto/src/wire.rs: u32 little-endian
 // length, then that many bytes whose first byte is the message kind.
+import CoreGraphics
 import Foundation
 import Network
 
@@ -152,12 +153,15 @@ func streamVideo(_ connection: NWConnection) async throws {
         }
     }
 
-    if let display = try? await ScreenCapture.mainDisplay() {
-        log("session: streaming real screen capture")
+    let scDisplay = try? await ScreenCapture.mainDisplay()
+    if let scDisplay, scDisplay.displayID == CGMainDisplayID() {
+        // The real main display is shareable (lid open / external attached): use ScreenCaptureKit,
+        // which is hardware-efficient and includes the cursor.
+        log("session: streaming the main display via ScreenCaptureKit")
         let capture = ScreenCapture(width: w, height: h) { pixelBuffer, ptsNanos in
             try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
         }
-        try await capture.start(display: display)
+        try await capture.start(display: scDisplay)
         // Send frames as they arrive until the client disconnects (a send then throws).
         do {
             while true {
@@ -169,8 +173,26 @@ func streamVideo(_ connection: NWConnection) async throws {
         }
         await capture.stop()
         encoder.finish()
+    } else if CGDisplayCreateImage(CGMainDisplayID()) != nil {
+        // Clamshell / headless: ScreenCaptureKit won't share the off built-in main display, but the
+        // legacy framebuffer API grabs its composited desktop (as Screen Sharing does). Poll it.
+        log("session: streaming the main display via framebuffer capture")
+        let capture = FramebufferCapture(displayID: CGMainDisplayID(), width: w, height: h, fps: 30) { pixelBuffer, ptsNanos in
+            try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
+        }
+        capture.begin()
+        do {
+            while true {
+                try await flush()
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+        } catch {
+            log("session: capture stream ended (\(error))")
+        }
+        capture.stop()
+        encoder.finish()
     } else {
-        log("session: no screen recording permission; streaming synthetic frames")
+        log("session: no capturable display; streaming synthetic frames")
         for i in 0..<streamFrameCount {
             guard let pb = syntheticPixelBuffer(width: w, height: h, tick: i) else { continue }
             try encoder.encode(pb, ptsNanos: UInt64(i) * UInt64(1_000_000_000 / fps), forceKeyframe: i == 0)

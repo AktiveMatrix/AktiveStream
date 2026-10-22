@@ -2,6 +2,7 @@
 // encoder. Requires Screen Recording TCC; until that is granted (e.g. when run over SSH), the
 // attempt to list shareable content fails and the caller falls back to synthetic frames. Just
 // making the attempt registers the (signed) agent in System Settings > Screen Recording.
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -29,6 +30,12 @@ final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecke
     /// agent for the permission) when it is not.
     static func mainDisplay() async throws -> SCDisplay {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        log("capture: shareable displays \(content.displays.map { $0.displayID }), system main \(CGMainDisplayID())")
+        // Prefer the system main display (where the menu bar and windows live) when it is shareable;
+        // on a clamshell Mac the capturable virtual display can be a separate, empty secondary.
+        if let main = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) {
+            return main
+        }
         guard let display = content.displays.first else { throw CaptureError.noDisplay }
         return display
     }
