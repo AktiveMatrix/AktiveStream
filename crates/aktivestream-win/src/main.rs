@@ -35,7 +35,9 @@ diagnostics:\n\
   --show-cursor          show the local cursor over the view (native hides it by default, as the\n\
                          remote cursor is already rendered into the video)\n\
   --no-scale-up          do not enlarge a remote screen smaller than the window; show it at 1:1,\n\
-                         centred (the default scales it up to fill the window, aspect kept)";
+                         centred (the default scales it up to fill the window, aspect kept)\n\
+  --generic, --pc        target a generic PC/Linux VNC server (wayvnc, TigerVNC, x11vnc, ...)\n\
+                         instead of a Mac: PC keyboard profile (Ctrl/Alt/Super), no Apple extensions";
 
 pub struct Args {
     pub host: String,
@@ -54,6 +56,10 @@ pub struct Args {
     pub tunnel: Option<String>,
     pub show_cursor: bool,
     pub no_scale_up: bool,
+    /// Target a generic PC/Linux VNC server (wayvnc, TigerVNC, x11vnc, ...) rather than a Mac:
+    /// the PC keyboard profile (Ctrl is Ctrl, Alt is Alt, Win is Super), standard X11 keysyms,
+    /// and no Apple-only extensions.
+    pub generic: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -70,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
     let mut native = false;
     let mut show_cursor = false;
     let mut no_scale_up = false;
+    let mut generic = false;
     let mut list = false;
     let mut tunnel = None;
     let mut args = std::env::args().skip(1);
@@ -82,6 +89,7 @@ fn parse_args() -> Result<Args, String> {
             "--native" => native = true,
             "--show-cursor" => show_cursor = true,
             "--no-scale-up" => no_scale_up = true,
+            "--generic" | "--pc" => generic = true,
             "--list" => list = true,
             "--tunnel" => tunnel = Some(args.next().ok_or("--tunnel needs an ssh destination")?),
             "--keylog" => keylog = Some(args.next().ok_or("--keylog needs a path")?.into()),
@@ -136,7 +144,16 @@ fn parse_args() -> Result<Args, String> {
         tunnel,
         show_cursor,
         no_scale_up,
+        generic,
     })
+}
+
+/// Builds RFB connect options, suppressing Apple-only extensions for a generic VNC server so it
+/// is not dropped for sending an unknown message.
+fn rfb_options(host: String, port: u16, user: Option<String>, password: String, generic: bool) -> ConnectOptions {
+    let mut options = ConnectOptions::new(host, port, user, password);
+    options.apple_extensions = !generic;
+    options
 }
 
 /// Prints saved connections. A GUI build has no console of its own, so attach the parent's.
@@ -208,7 +225,7 @@ fn run() -> Result<(), String> {
     // Connect the first target, capturing the login (user, password) to reuse for extra sessions.
     let (session, username, password) = if let Some(var) = &args.password_env {
         let password = std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))?;
-        let options = ConnectOptions::new(conn_host.clone(), conn_port, args.user.clone(), password.clone());
+        let options = rfb_options(conn_host.clone(), conn_port, args.user.clone(), password.clone(), args.generic);
         let session = aktivestream_rfb::connect(&options)
             .map_err(|e| format!("Could not connect to {}:{}\n\n{e}", args.host, args.port))?;
         (session, args.user.clone(), password)
@@ -224,7 +241,8 @@ fn run() -> Result<(), String> {
                 },
             };
             let username = (!login.user.is_empty()).then(|| login.user.clone());
-            let options = ConnectOptions::new(conn_host.clone(), conn_port, username.clone(), login.password.clone());
+            let options =
+                rfb_options(conn_host.clone(), conn_port, username.clone(), login.password.clone(), args.generic);
             match aktivestream_rfb::connect(&options) {
                 Ok(session) => {
                     if save {
@@ -256,7 +274,7 @@ fn run() -> Result<(), String> {
         } else {
             (h, p)
         };
-        let options = ConnectOptions::new(eh, ep, username.clone(), password.clone());
+        let options = rfb_options(eh, ep, username.clone(), password.clone(), args.generic);
         let session =
             aktivestream_rfb::connect(&options).map_err(|e| format!("Could not connect to {extra}\n\n{e}"))?;
         sessions.push((extra.clone(), session));

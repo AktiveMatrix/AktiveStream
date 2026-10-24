@@ -98,6 +98,43 @@ pub(crate) fn mac_native() -> Profile {
     }
 }
 
+/// A PC keyboard driving a generic PC or Linux VNC server (wayvnc, TigerVNC, x11vnc, ...).
+/// Ctrl is Ctrl, Alt is Alt and the Win key is Super, so nothing is rewritten and the remote
+/// desktop handles its own shortcuts. Pairs with [`crate::RfbTranslator::generic`].
+pub(crate) fn pc_generic() -> Profile {
+    use Key::*;
+    const CTRL: PhysMods = PhysMods::CTRL;
+    const ALT: PhysMods = PhysMods::ALT;
+    const WIN: PhysMods = PhysMods::WIN;
+
+    Profile {
+        name: "PC / Linux".to_string(),
+        modifier_map: vec![
+            (LCtrl, HostMod::Control),
+            (RCtrl, HostMod::Control),
+            (LAlt, HostMod::Option),
+            (RAlt, HostMod::Option),
+            (LWin, HostMod::Command),
+            (RWin, HostMod::Command),
+            (LShift, HostMod::Shift),
+            (RShift, HostMod::Shift),
+        ],
+        // A PC keyboard already matches a PC/Linux target; the remote desktop owns its shortcuts.
+        conversions: vec![],
+        // Only the client's own escape hatches, as on the Mac-native profile; the toolbar offers
+        // the same actions. Ctrl+Alt+Left is left for the remote (Linux workspace switching).
+        local_shortcuts: vec![
+            shortcut(CTRL | ALT, F11, LocalAction::ToggleFullscreen),
+            shortcut(CTRL | ALT, W, LocalAction::Disconnect),
+        ],
+        system_shortcuts: SystemShortcutMode::InFullscreen,
+        // A PC/Linux target has a real right button; Ctrl+click is just Ctrl+click.
+        mouse: MouseRules { ctrl_click_is_right_click: false, ctrl_win_click_is_middle_click: false },
+        // Keep the local Windows Magnifier chords on the PC so magnification still works.
+        windows_chords: vec![(WIN, Equal), (WIN, NumpadAdd), (WIN, Minus), (WIN, NumpadSubtract), (WIN, Escape)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +149,18 @@ mod tests {
         assert_eq!(modifier(Key::LAlt), Some(HostMod::Option), "Option passes through");
         assert_eq!(modifier(Key::LCtrl), Some(HostMod::Control), "Control passes through");
         assert_eq!(modifier(Key::RWin), Some(HostMod::Command));
+    }
+
+    #[test]
+    fn pc_generic_maps_ctrl_to_control_not_command() {
+        let p = pc_generic();
+        assert!(p.conversions.is_empty(), "a PC keyboard needs no rewrites for a PC/Linux target");
+        let modifier = |k: Key| p.modifier_map.iter().find(|(key, _)| *key == k).map(|(_, m)| *m);
+        // The key Jump's macOS profile turns into Command stays Control here.
+        assert_eq!(modifier(Key::LCtrl), Some(HostMod::Control), "Left Ctrl is Control, not Command");
+        assert_eq!(modifier(Key::LAlt), Some(HostMod::Option), "Alt is Option (Alt_L on the wire)");
+        assert_eq!(modifier(Key::LWin), Some(HostMod::Command), "Win is Command (Super on the wire)");
+        assert!(!p.mouse.ctrl_click_is_right_click, "Ctrl+click is not a right click on a PC/Linux target");
+        assert!(!p.windows_chords.is_empty(), "local Magnifier chords are kept");
     }
 }

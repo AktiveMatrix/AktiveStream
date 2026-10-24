@@ -7,6 +7,7 @@ use crate::{HostEvent, HostMod, HostMods, Key};
 const XK_SHIFT_L: u32 = 0xffe1;
 const XK_CONTROL_L: u32 = 0xffe3;
 const XK_META_L: u32 = 0xffe7;
+const XK_ALT_L: u32 = 0xffe9;
 const XK_SUPER_L: u32 = 0xffeb;
 
 /// Recorded for a held key whose press sent nothing (a dead key), so its release sends
@@ -21,9 +22,17 @@ pub(crate) struct Translator {
     held: HashMap<Key, u32>,
     /// A dead key (Option+E, Option+U, ...) waiting for the next key.
     pending: Option<Accent>,
+    /// Target a generic X11 server (wayvnc, TigerVNC, x11vnc, ...) instead of Apple Screen
+    /// Sharing: Option is Alt, not Meta, and the Mac Option layer and dead keys are off, so a
+    /// key sends its own US keysym and the server's own layout applies the modifiers we send.
+    generic: bool,
 }
 
 impl Translator {
+    pub(crate) fn generic() -> Translator {
+        Translator { generic: true, ..Translator::default() }
+    }
+
     pub(crate) fn set_caps_lock(&mut self, on: bool) {
         self.caps = on;
     }
@@ -32,7 +41,7 @@ impl Translator {
         match event {
             HostEvent::Mod { m, down } => {
                 self.mods.set(m.flag(), down);
-                vec![(modifier_keysym(m), down)]
+                vec![(self.modifier_keysym(m), down)]
             }
             HostEvent::Key { key, down: true } => {
                 if let Some(&keysym) = self.held.get(&key) {
@@ -52,6 +61,17 @@ impl Translator {
     /// it (measured: Option+8 typed "8"), so the Option layer of the Mac's US layout, and
     /// its dead-key accents, are applied here and sent as the resulting characters.
     fn press(&mut self, key: Key) -> Vec<(u32, bool)> {
+        // A generic X11 target has no Mac Option layer: a key sends its own US keysym and the
+        // server applies the Alt/Control/Super modifiers we report alongside it.
+        if self.generic {
+            return match self.keysym(key) {
+                Some(keysym) => {
+                    self.held.insert(key, keysym);
+                    vec![(keysym, true)]
+                }
+                None => Vec::new(),
+            };
+        }
         let mut out = Vec::new();
         let typing = !self.mods.intersects(HostMods::COMMAND | HostMods::CONTROL);
         let printable = letter(key).is_some() || us_symbol(key).is_some();
@@ -90,6 +110,24 @@ impl Translator {
             out.push((keysym, true));
         }
         out
+    }
+
+    /// Measured on macOS 26.6.2 Screen Sharing: Shift_L, Control_L, Meta_L and Super_L produce
+    /// Shift, Control, Option and Command. A generic X11 target wants the real Alt_L for Option
+    /// instead (Super stays Super, which is a Linux desktop's own Super/Windows key).
+    fn modifier_keysym(&self, m: HostMod) -> u32 {
+        match m {
+            HostMod::Shift => XK_SHIFT_L,
+            HostMod::Control => XK_CONTROL_L,
+            HostMod::Option => {
+                if self.generic {
+                    XK_ALT_L
+                } else {
+                    XK_META_L
+                }
+            }
+            HostMod::Command => XK_SUPER_L,
+        }
     }
 
     fn keysym(&self, key: Key) -> Option<u32> {
@@ -261,17 +299,6 @@ fn option_layer(key: Key, shift: bool) -> Option<OptionOut> {
         _ => return None,
     };
     Some(if shift { shifted } else { plain })
-}
-
-/// Measured on macOS 26.6.2 Screen Sharing: these four are the keysyms that produce
-/// Shift, Control, Option and Command. Control_R produces nothing and is never sent.
-fn modifier_keysym(m: HostMod) -> u32 {
-    match m {
-        HostMod::Shift => XK_SHIFT_L,
-        HostMod::Control => XK_CONTROL_L,
-        HostMod::Option => XK_META_L,
-        HostMod::Command => XK_SUPER_L,
-    }
 }
 
 fn letter(key: Key) -> Option<u8> {
@@ -598,5 +625,38 @@ mod tests {
     fn unmatched_release_still_releases() {
         let mut t = Translator::default();
         assert_eq!(release(&mut t, Key::B), [(u32::from(b'b'), false)]);
+    }
+
+    #[test]
+    fn generic_modifiers_use_alt_not_meta() {
+        let mut t = Translator::generic();
+        assert_eq!(modifier(&mut t, HostMod::Option, true), [(0xffe9, true)], "Option is Alt_L on a PC target");
+        assert_eq!(modifier(&mut t, HostMod::Command, true), [(0xffeb, true)], "Command stays Super_L");
+        assert_eq!(modifier(&mut t, HostMod::Control, true), [(0xffe3, true)]);
+        assert_eq!(modifier(&mut t, HostMod::Shift, true), [(0xffe1, true)]);
+    }
+
+    #[test]
+    fn generic_has_no_option_layer_or_dead_keys() {
+        let mut t = Translator::generic();
+        modifier(&mut t, HostMod::Option, true);
+        // Alt+8 is the 8 key, not a bullet; Alt+E is the e key, not a dead accent.
+        assert_eq!(type_key(&mut t, Key::Digit8), [(0x38, true), (0x38, false)]);
+        assert_eq!(type_key(&mut t, Key::E), [(0x65, true), (0x65, false)]);
+        modifier(&mut t, HostMod::Option, false);
+        // A following e is a plain e, with no accent composed onto it.
+        assert_eq!(type_key(&mut t, Key::E), [(0x65, true), (0x65, false)]);
+    }
+
+    #[test]
+    fn generic_still_shifts_letters_and_symbols() {
+        let mut t = Translator::generic();
+        modifier(&mut t, HostMod::Shift, true);
+        assert_eq!(press(&mut t, Key::A), [(0x41, true)], "Shift+a is A");
+        release(&mut t, Key::A);
+        assert_eq!(press(&mut t, Key::Digit1), [(u32::from(b'!'), true)], "Shift+1 is !");
+        release(&mut t, Key::Digit1);
+        modifier(&mut t, HostMod::Shift, false);
+        assert_eq!(press(&mut t, Key::Enter), [(0xff0d, true)], "Enter is still Return");
     }
 }

@@ -260,6 +260,13 @@ impl Profile {
     pub fn mac_native() -> Profile {
         profile::mac_native()
     }
+
+    /// A PC keyboard driving a generic PC or Linux VNC server (wayvnc, TigerVNC, x11vnc, ...):
+    /// Ctrl is Control, Alt is Option (Alt_L on the wire), the Win key is Command (Super), and
+    /// nothing is rewritten. Pairs with [`RfbTranslator::generic`].
+    pub fn pc_generic() -> Profile {
+        profile::pc_generic()
+    }
 }
 
 /// A physical key transition reported by the platform layer.
@@ -383,6 +390,14 @@ pub struct RfbTranslator {
 impl RfbTranslator {
     pub fn new() -> RfbTranslator {
         RfbTranslator::default()
+    }
+
+    /// For a generic X11 VNC server (wayvnc, TigerVNC, x11vnc, ...) rather than Apple Screen
+    /// Sharing: Option is sent as Alt_L, and the Mac Option layer and dead keys are off, so each
+    /// key sends its own US-layout keysym and the server's own layout applies the modifiers.
+    /// Pairs with [`Profile::pc_generic`].
+    pub fn generic() -> RfbTranslator {
+        RfbTranslator { state: keysym::Translator::generic() }
     }
 
     /// Local Caps Lock state, read by the platform layer before each key event.

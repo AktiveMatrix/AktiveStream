@@ -1155,7 +1155,12 @@ pub fn run_window(
     HIDE_CURSOR.store(args.native && !args.show_cursor, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     let (sink, translator) = match backend {
-        Backend::Rfb => (Sink::Rfb(tx.clone()), KeyTranslator::Rfb(RfbTranslator::new())),
+        // A generic PC/Linux VNC server (--generic) uses standard X11 keysyms; a Mac uses the
+        // Apple Screen Sharing translator.
+        Backend::Rfb => {
+            let t = if args.generic { RfbTranslator::generic() } else { RfbTranslator::new() };
+            (Sink::Rfb(tx.clone()), KeyTranslator::Rfb(t))
+        }
         Backend::Native(input_tx) => (Sink::Native(input_tx), KeyTranslator::Native(NativeInput::new())),
     };
     let fail = |what: &str, e: windows::core::Error| format!("{what} failed: {e}");
@@ -1209,7 +1214,9 @@ pub fn run_window(
         hwnd: AtomicIsize::new(hwnd.0 as isize),
         view_only: args.view_only,
         state: Mutex::new(KeyState {
-            engine: Engine::new(Profile::mac_default()),
+            // The PC/Linux profile (Ctrl/Alt/Super, no rewrites) for --generic; the macOS profile
+            // otherwise.
+            engine: Engine::new(if args.generic { Profile::pc_generic() } else { Profile::mac_default() }),
             translator,
             sink: sink.clone(),
             caps: unsafe { GetKeyState(i32::from(VK_CAPITAL.0)) } & 1 != 0,

@@ -41,6 +41,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// or shown at 1:1, centred (`--no-scale-up`). Set once in `main`, read when an `App` is built.
 static SCALE_UP_FILL: AtomicBool = AtomicBool::new(true);
 
+/// `--generic` / `--pc`: target a generic PC/Linux VNC server (wayvnc, TigerVNC, x11vnc, ...)
+/// rather than a Mac. Set once in `main`, read where the profile, translator and connect options
+/// are built.
+static GENERIC: AtomicBool = AtomicBool::new(false);
+
 /// Where the remote framebuffer sits in the window: scaled to fit with the aspect ratio kept and
 /// centred, enlarging past 1:1 to fill the window only when `scale_up` is set. The same geometry
 /// the Windows client's `View::fit_scaled` computes, in physical window pixels.
@@ -71,6 +76,10 @@ fn fit_view(fb_w: u32, fb_h: u32, win_w: u32, win_h: u32, scale_up: bool) -> Vie
 /// The keyboard profile for this build: the macOS client drives a remote Mac from a Mac keyboard
 /// (identity), every other target drives it from a PC keyboard (the remap profile).
 fn default_profile() -> Profile {
+    // A generic PC/Linux target overrides the platform default on either client.
+    if GENERIC.load(Ordering::Relaxed) {
+        return Profile::pc_generic();
+    }
     #[cfg(target_os = "macos")]
     {
         Profile::mac_native()
@@ -79,6 +88,20 @@ fn default_profile() -> Profile {
     {
         Profile::mac_default()
     }
+}
+
+/// RFB translator for the target: generic X11 keysyms for a PC/Linux server, Apple Screen Sharing
+/// keysyms otherwise.
+fn rfb_translator() -> RfbTranslator {
+    if GENERIC.load(Ordering::Relaxed) { RfbTranslator::generic() } else { RfbTranslator::new() }
+}
+
+/// RFB connect options, suppressing Apple-only extensions for a generic VNC server so it is not
+/// dropped for an unknown message.
+fn rfb_options(host: String, port: u16, username: Option<String>, password: String) -> ConnectOptions {
+    let mut options = ConnectOptions::new(host, port, username, password);
+    options.apple_extensions = !GENERIC.load(Ordering::Relaxed);
+    options
 }
 
 struct Shared {
@@ -946,6 +969,11 @@ fn main() -> Result<(), String> {
         args.remove(i);
         SCALE_UP_FILL.store(false, Ordering::Relaxed);
     }
+    // `--generic` / `--pc`: PC keyboard profile and standard X11 keysyms for a non-Mac VNC server.
+    if let Some(i) = args.iter().position(|a| a == "--generic" || a == "--pc") {
+        args.remove(i);
+        GENERIC.store(true, Ordering::Relaxed);
+    }
 
     // `--tunnel <spec>` routes the RFB path through an SSH forward (TCP).
     let mut tunnel_flag: Option<String> = None;
@@ -1041,7 +1069,7 @@ fn main() -> Result<(), String> {
     };
     let username = saved_user.or_else(|| std::env::var("RFB_USER").ok());
     let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
-    let options = ConnectOptions::new(rfb_host, rfb_port, username, password);
+    let options = rfb_options(rfb_host, rfb_port, username, password);
 
     // Headless verification modes (single session only).
     if let Ok(path) = std::env::var("AKTIVE_SNAPSHOT") {
@@ -1055,7 +1083,7 @@ fn main() -> Result<(), String> {
     eprintln!("connected to {} ({}x{})", info.name, info.width, info.height);
     let session = Session {
         shared: Arc::new(Shared::new(info.width as u32, info.height as u32)),
-        backend: Backend::Rfb { writer, translator: RfbTranslator::new() },
+        backend: Backend::Rfb { writer, translator: rfb_translator() },
         title,
         cursor_shape: None,
         _tunnel: tunnel_guard,
@@ -1090,12 +1118,12 @@ fn connect_rfb(target: &str, tunnel_flag: &Option<String>) -> Result<(Session, S
         (host, port)
     };
     let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
-    let options = ConnectOptions::new(rfb_host, rfb_port, username, password);
+    let options = rfb_options(rfb_host, rfb_port, username, password);
     let (info, reader, writer) = connect(&options).map_err(|e| format!("connect {target}: {e}"))?;
     eprintln!("connected to {} ({}x{})", info.name, info.width, info.height);
     let session = Session {
         shared: Arc::new(Shared::new(info.width as u32, info.height as u32)),
-        backend: Backend::Rfb { writer, translator: RfbTranslator::new() },
+        backend: Backend::Rfb { writer, translator: rfb_translator() },
         title: target.to_string(),
         cursor_shape: None,
         _tunnel: tunnel_guard,
