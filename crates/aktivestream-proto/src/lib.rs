@@ -312,7 +312,16 @@ pub async fn connect(addr: SocketAddr, expected_fingerprint: Option<String>) -> 
     crypto.alpn_protocols = vec![ALPN.to_vec()];
 
     let quic_crypto = QuicClientConfig::try_from(crypto).map_err(|e| Error::QuicConfig(e.to_string()))?;
-    let client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+    // Keep the connection alive while the remote screen is static: ScreenCaptureKit emits no frames
+    // when nothing changes, so without a periodic keep-alive the QUIC idle timeout fires and
+    // abruptly drops the session. Ping every 5s, well under the 30s idle timeout.
+    let mut transport = quinn::TransportConfig::default();
+    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+        transport.max_idle_timeout(Some(idle));
+    }
+    client_config.transport_config(Arc::new(transport));
     let mut endpoint = quinn::Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into())?;
     endpoint.set_default_client_config(client_config);
 

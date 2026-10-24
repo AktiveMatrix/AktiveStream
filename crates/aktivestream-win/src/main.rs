@@ -31,7 +31,9 @@ diagnostics:\n\
   --exit-after SECS      close the session after SECS seconds and print statistics\n\
   --view-only            send no keyboard or mouse input (keys still reach --keylog)\n\
   --keylog PATH          log every keyboard-hook event, its routing and keysyms, and clipboard traffic\n\
-  --native               connect to the Phase 2 native host (QUIC + HEVC) instead of VNC";
+  --native               connect to the Phase 2 native host (QUIC + HEVC) instead of VNC\n\
+  --show-cursor          show the local cursor over the view (native hides it by default, as the\n\
+                         remote cursor is already rendered into the video)";
 
 pub struct Args {
     pub host: String,
@@ -48,6 +50,7 @@ pub struct Args {
     pub keylog: Option<std::path::PathBuf>,
     pub native: bool,
     pub tunnel: Option<String>,
+    pub show_cursor: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,6 +65,7 @@ fn parse_args() -> Result<Args, String> {
     let mut view_only = false;
     let mut keylog = None;
     let mut native = false;
+    let mut show_cursor = false;
     let mut list = false;
     let mut tunnel = None;
     let mut args = std::env::args().skip(1);
@@ -72,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
             "--forget" => forget = true,
             "--view-only" => view_only = true,
             "--native" => native = true,
+            "--show-cursor" => show_cursor = true,
             "--list" => list = true,
             "--tunnel" => tunnel = Some(args.next().ok_or("--tunnel needs an ssh destination")?),
             "--keylog" => keylog = Some(args.next().ok_or("--keylog needs a path")?.into()),
@@ -124,6 +129,7 @@ fn parse_args() -> Result<Args, String> {
         keylog,
         native,
         tunnel,
+        show_cursor,
     })
 }
 

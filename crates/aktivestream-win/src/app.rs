@@ -912,6 +912,10 @@ fn on_paint(hwnd: HWND) {
     }
 }
 
+/// When true, the client hides the local cursor over its client area (the native path renders the
+/// remote cursor into the video, so a local cursor would double it). Set in `run_window`.
+static HIDE_CURSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match message {
         WM_ERASEBKGND => return LRESULT(1),
@@ -956,6 +960,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             return LRESULT(0);
         }
         WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
+            if HIDE_CURSOR.load(std::sync::atomic::Ordering::Relaxed) {
+                unsafe { SetCursor(None) };
+                return LRESULT(1);
+            }
             if let Some(Some(handle)) = with_app(|app| app.cursor_handle()) {
                 unsafe { SetCursor(Some(handle)) };
                 return LRESULT(1);
@@ -1096,6 +1104,9 @@ pub fn run_window(
     others: Vec<WinSession>,
     start_source: impl FnOnce(Arc<Shared>, mpsc::Receiver<Out>),
 ) -> Result<(), String> {
+    // Native renders the remote cursor into the video, so hide the local one over the view unless
+    // --show-cursor is given; the RFB path draws its own cursor shape and keeps the local cursor.
+    HIDE_CURSOR.store(args.native && !args.show_cursor, std::sync::atomic::Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
     let (sink, translator) = match backend {
         Backend::Rfb => (Sink::Rfb(tx.clone()), KeyTranslator::Rfb(RfbTranslator::new())),
