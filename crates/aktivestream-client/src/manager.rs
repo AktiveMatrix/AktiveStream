@@ -14,8 +14,16 @@ const PAD: usize = 24;
 const TITLE_SCALE: usize = 3;
 const ROW_SCALE: usize = 2;
 const HINT_SCALE: usize = 1;
-/// Top edge of the first list row (below the title and search line).
-const LIST_TOP: usize = 96;
+/// The clickable toolbar of actions, below the title.
+const TOOLBAR_Y: usize = 62;
+const BTN_H: usize = 34;
+const BTN_SCALE: usize = 2;
+const BTN_PAD: usize = 14;
+const BTN_GAP: usize = 10;
+/// The search / help line, below the toolbar.
+const SEARCH_Y: usize = 106;
+/// Top edge of the first list row (below the title, toolbar and search line).
+const LIST_TOP: usize = 134;
 const ROW_H: usize = 44;
 /// Top edge of the first form field.
 const FORM_TOP: usize = 104;
@@ -32,6 +40,9 @@ const FIELD_BG: u32 = 0x1e_1e_22;
 const FIELD_BORDER: u32 = 0x3a_3a_40;
 const ERROR: u32 = 0xff_6b_6b;
 const STAR: u32 = 0xff_c8_4a;
+const BTN_BG: u32 = 0x2a2a32;
+const BTN_PRIMARY_BG: u32 = 0x27_43_82;
+const DANGER: u32 = 0xb8_55_55;
 
 // Form field indices, in focus order.
 const F_NAME: usize = 0;
@@ -94,6 +105,25 @@ pub enum Outcome {
     StorePassword { host: String, username: String, password: String },
     /// Forget any stored password for `host` (the connection was deleted), then repaint.
     ForgetPassword { host: String },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnStyle {
+    Normal,
+    Primary,
+    Danger,
+}
+
+/// A clickable toolbar/footer button. Clicking it replays `event` through the state machine, so a
+/// button and its keyboard shortcut are one code path.
+struct Button {
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    label: &'static str,
+    event: KeyEvent,
+    style: BtnStyle,
 }
 
 /// The in-progress add/edit form. Text fields hold their editable strings; the password starts
@@ -501,8 +531,93 @@ impl Manager {
         self.view = View::List { selected, search: String::new() };
     }
 
-    /// The connection at a clicked row (list view only), by its position in the full list.
+    /// Buttons for the current view: the list toolbar, or the form / confirm footer. Clicking one
+    /// replays its `event`, so a button and its shortcut share the state machine.
+    fn buttons(&self, dh: usize) -> Vec<Button> {
+        use KeyCode::{Char, Delete, Enter, Escape};
+        let mut out = Vec::new();
+        let mut place = |x: &mut usize, y: usize, label: &'static str, event: KeyEvent, style: BtnStyle| {
+            let w = draw::text_width(label, BTN_SCALE) + 2 * BTN_PAD;
+            out.push(Button { x: *x, y, w, h: BTN_H, label, event, style });
+            *x += w + BTN_GAP;
+        };
+        match &self.view {
+            View::List { .. } => {
+                let mut x = PAD;
+                place(&mut x, TOOLBAR_Y, "New", KeyEvent::ctrl(Char('n')), BtnStyle::Primary);
+                place(&mut x, TOOLBAR_Y, "Edit", KeyEvent::ctrl(Char('e')), BtnStyle::Normal);
+                place(&mut x, TOOLBAR_Y, "Duplicate", KeyEvent::ctrl(Char('d')), BtnStyle::Normal);
+                place(&mut x, TOOLBAR_Y, "Favorite", KeyEvent::ctrl(Char('f')), BtnStyle::Normal);
+                place(&mut x, TOOLBAR_Y, "Delete", KeyEvent::new(Delete), BtnStyle::Danger);
+            }
+            View::Edit(_) => {
+                let y = dh.saturating_sub(BTN_H + 16);
+                let mut x = PAD;
+                place(&mut x, y, "Save", KeyEvent::new(Enter), BtnStyle::Primary);
+                place(&mut x, y, "Cancel", KeyEvent::new(Escape), BtnStyle::Normal);
+            }
+            View::ConfirmDelete { .. } => {
+                let y = LIST_TOP + 48;
+                let mut x = PAD;
+                place(&mut x, y, "Delete", KeyEvent::new(Enter), BtnStyle::Danger);
+                place(&mut x, y, "Cancel", KeyEvent::new(Escape), BtnStyle::Normal);
+            }
+        }
+        out
+    }
+
+    fn render_buttons(buf: &mut [u32], dw: usize, buttons: &[Button]) {
+        for b in buttons {
+            let (bg, border) = match b.style {
+                BtnStyle::Primary => (BTN_PRIMARY_BG, ACCENT),
+                BtnStyle::Normal => (BTN_BG, FIELD_BORDER),
+                BtnStyle::Danger => (BTN_BG, DANGER),
+            };
+            draw::fill_rect(buf, dw, b.x, b.y, b.w, b.h, bg);
+            draw::rect_outline(buf, dw, b.x, b.y, b.w, b.h, border);
+            let label_color = if matches!(b.style, BtnStyle::Danger) { DANGER } else { TEXT };
+            let ty = b.y + (b.h - 8 * BTN_SCALE) / 2;
+            draw::text(buf, dw, b.x + BTN_PAD, ty, b.label, label_color, b.x + b.w, BTN_SCALE);
+        }
+    }
+
+    /// Highlights the list row under the cursor (no action), so a following toolbar-button click
+    /// targets it. Returns whether the selection moved.
+    pub fn hover(&mut self, x: i32, y: i32, dh: usize) -> Outcome {
+        let search = match &self.view {
+            View::List { search, .. } => search.clone(),
+            _ => return Outcome::Idle,
+        };
+        if x < 0 || y < LIST_TOP as i32 {
+            return Outcome::Idle;
+        }
+        let row = (y as usize - LIST_TOP) / ROW_H;
+        let vis = self.visible(&search);
+        if row >= vis.len() || LIST_TOP + (row + 1) * ROW_H > dh {
+            return Outcome::Idle;
+        }
+        if let View::List { selected, .. } = &mut self.view
+            && *selected != row
+        {
+            *selected = row;
+            return Outcome::Redraw;
+        }
+        Outcome::Idle
+    }
+
+    /// A click: a toolbar/footer button (replayed as its key event), or a list row (connect).
     pub fn click(&mut self, x: i32, y: i32, dh: usize) -> Outcome {
+        if x >= 0 && y >= 0 {
+            let (cx, cy) = (x as usize, y as usize);
+            if let Some(event) = self
+                .buttons(dh)
+                .into_iter()
+                .find(|b| cx >= b.x && cx < b.x + b.w && cy >= b.y && cy < b.y + b.h)
+                .map(|b| b.event)
+            {
+                return self.key(event);
+            }
+        }
         let search = match &self.view {
             View::List { search, .. } => search.clone(),
             _ => return Outcome::Idle,
@@ -528,18 +643,20 @@ impl Manager {
             View::Edit(form) => self.draw_form(buf, dw, dh, form),
             View::ConfirmDelete { name, .. } => self.draw_confirm(buf, dw, dh, name),
         }
+        let buttons = self.buttons(dh);
+        Self::render_buttons(buf, dw, &buttons);
     }
 
     fn draw_list(&self, buf: &mut [u32], dw: usize, dh: usize, selected: usize, search: &str) {
         let right = dw.saturating_sub(PAD);
         draw::text(buf, dw, PAD, PAD, "AktiveStream", TEXT, right, TITLE_SCALE);
         let search_line = if search.is_empty() {
-            "Type to search   Ctrl+N new  Ctrl+E edit  Del delete  Ctrl+D dup  Ctrl+F fav  Enter open".to_string()
+            "Type to search.   Click a row to connect.   Buttons act on the highlighted row.".to_string()
         } else {
-            format!("Search: {search}")
+            format!("Search: {search}    (Backspace clears)")
         };
         let search_color = if search.is_empty() { DIM } else { ACCENT };
-        draw::text(buf, dw, PAD, PAD + 8 * TITLE_SCALE + 10, &search_line, search_color, right, HINT_SCALE);
+        draw::text(buf, dw, PAD, SEARCH_Y, &search_line, search_color, right, HINT_SCALE);
 
         let vis = self.visible(search);
         if vis.is_empty() {
@@ -617,7 +734,7 @@ impl Manager {
         if let Some(err) = &form.error {
             draw::text(buf, dw, PAD, hint_y, err, ERROR, right, ROW_SCALE);
         }
-        let hint = "Tab/arrows field   Space toggle   Ctrl+P show password   Enter save   Esc cancel";
+        let hint = "Tab or arrows move between fields    Space toggles    Ctrl+P shows the password";
         draw::text(buf, dw, PAD, hint_y + 24, hint, DIM, right, HINT_SCALE);
     }
 
@@ -660,7 +777,17 @@ impl Manager {
         let line = format!("Delete \"{name}\" from the phone book?");
         draw::text(buf, dw, PAD, LIST_TOP, &line, SUBTLE, right, ROW_SCALE);
         let _ = dh;
-        draw::text(buf, dw, PAD, LIST_TOP + 48, "Enter / Y  delete      Esc / N  cancel", DIM, right, HINT_SCALE);
+        // The Delete / Cancel buttons are drawn by `draw`; note the keyboard equivalents below them.
+        draw::text(
+            buf,
+            dw,
+            PAD,
+            LIST_TOP + 48 + BTN_H + 14,
+            "or press Enter to delete, Esc to cancel",
+            DIM,
+            right,
+            HINT_SCALE,
+        );
     }
 }
 
@@ -845,6 +972,42 @@ mod tests {
         match &m.view {
             View::Edit(form) => assert!(form.error.as_deref().unwrap().contains("Host")),
             _ => panic!("should still be on the form"),
+        }
+    }
+
+    #[test]
+    fn clicking_the_new_toolbar_button_opens_the_form() {
+        let mut m = mgr();
+        // "New" is the first toolbar button, at (PAD, TOOLBAR_Y).
+        assert_eq!(m.click((PAD + 6) as i32, (TOOLBAR_Y + 6) as i32, 680), Outcome::Redraw);
+        assert!(matches!(m.view, View::Edit(_)));
+    }
+
+    #[test]
+    fn hover_highlights_the_row_under_the_cursor() {
+        let mut m = mgr(); // sorted: studio (fav), air, pi
+        assert_eq!(m.hover(10, (LIST_TOP + ROW_H + 4) as i32, 680), Outcome::Redraw);
+        assert_eq!(selected_name(&m).as_deref(), Some("air"));
+        // Hovering the same row again does nothing.
+        assert_eq!(m.hover(10, (LIST_TOP + ROW_H + 4) as i32, 680), Outcome::Idle);
+    }
+
+    #[test]
+    fn clicking_a_list_row_connects() {
+        let mut m = mgr();
+        assert_eq!(m.click(10, (LIST_TOP + 4) as i32, 680), Outcome::Connect("studio".into()));
+    }
+
+    #[test]
+    fn clicking_delete_button_after_hover_asks_to_delete_that_row() {
+        let mut m = mgr();
+        m.hover(10, (LIST_TOP + ROW_H + 4) as i32, 680); // select "air"
+        // The Delete button is the last toolbar button; click near the right end of the toolbar.
+        let del = m.buttons(680).into_iter().find(|b| b.label == "Delete").unwrap();
+        assert_eq!(m.click((del.x + 4) as i32, (del.y + 4) as i32, 680), Outcome::Redraw);
+        match &m.view {
+            View::ConfirmDelete { name, .. } => assert_eq!(name, "air"),
+            _ => panic!("expected the delete confirmation"),
         }
     }
 }

@@ -811,7 +811,11 @@ impl ApplicationHandler<()> for PickerApp {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(_) => self.request_redraw(),
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+                let outcome = self.manager.hover(position.x as i32, position.y as i32, self.window_height());
+                self.apply(outcome, event_loop);
+            }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: WinitButton::Left, .. } => {
                 let outcome = self.manager.click(self.cursor.0 as i32, self.cursor.1 as i32, self.window_height());
                 self.apply(outcome, event_loop);

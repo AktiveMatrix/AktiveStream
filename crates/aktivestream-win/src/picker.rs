@@ -23,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     IDC_ARROW, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW, SWP_NOMOVE, SWP_NOZORDER,
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_PAINT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_PAINT, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::w;
 
@@ -248,6 +248,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             {
                 dispatch(hwnd, KeyEvent::new(KeyCode::Char(ch)));
             }
+            return LRESULT(0);
+        }
+        WM_MOUSEMOVE => {
+            let h = client_size(hwnd).1;
+            let outcome = with_picker(|p| p.manager.hover(px(), py(), h)).unwrap_or(Outcome::Idle);
+            handle(hwnd, outcome);
             return LRESULT(0);
         }
         WM_LBUTTONDOWN => {
