@@ -10,13 +10,14 @@
 
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
+    #[default]
     Rfb,
     Native,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Connection {
     pub name: String,
     pub host: String,
@@ -28,6 +29,8 @@ pub struct Connection {
     /// A generic PC/Linux VNC server (wayvnc, TigerVNC, ...) rather than a Mac: the PC keyboard
     /// profile and no Apple-only extensions (RFB only); a bare `generic` token in the file.
     pub generic: bool,
+    /// Pinned to the top of the connection list; a bare `favorite` token in the file.
+    pub favorite: bool,
 }
 
 /// Path to the connections file, honouring XDG then `HOME` then (Windows) `APPDATA`.
@@ -80,16 +83,19 @@ fn parse_line(line: &str) -> Option<Connection> {
     let mut username = None;
     let mut tunnel = None;
     let mut generic = false;
+    let mut favorite = false;
     for token in fields {
         if let Some(spec) = token.strip_prefix("tunnel=") {
             tunnel = Some(spec.to_string());
         } else if token == "generic" {
             generic = true;
+        } else if token == "favorite" {
+            favorite = true;
         } else if username.is_none() {
             username = Some(token.to_string());
         }
     }
-    Some(Connection { name, host, port, mode, username, tunnel, generic })
+    Some(Connection { name, host, port, mode, username, tunnel, generic, favorite })
 }
 
 /// Serializes connections back to the file format: a header comment and one aligned line each.
@@ -110,6 +116,9 @@ pub fn serialize(connections: &[Connection]) -> String {
         }
         if c.generic {
             line.push_str(" generic");
+        }
+        if c.favorite {
+            line.push_str(" favorite");
         }
         out.push_str(line.trim_end());
         out.push('\n');
@@ -164,7 +173,7 @@ mod tests {
 mac            192.168.1.50   35390  native
 mac-share      192.168.1.50   5900   rfb     user
 mac-remote     192.168.1.50   5900   rfb     user  tunnel=me@jump:2222
-pi             192.168.50.56  5901   rfb     generic
+pi             192.168.50.56  5901   rfb     generic favorite
 
 bad line with too few
 weird          host           70000  native
@@ -179,9 +188,7 @@ unknownmode    host           5900   telnet
                     host: "192.168.1.50".into(),
                     port: 35390,
                     mode: Mode::Native,
-                    username: None,
-                    tunnel: None,
-                    generic: false,
+                    ..Default::default()
                 },
                 Connection {
                     name: "mac-share".into(),
@@ -189,8 +196,7 @@ unknownmode    host           5900   telnet
                     port: 5900,
                     mode: Mode::Rfb,
                     username: Some("user".into()),
-                    tunnel: None,
-                    generic: false,
+                    ..Default::default()
                 },
                 Connection {
                     name: "mac-remote".into(),
@@ -199,16 +205,16 @@ unknownmode    host           5900   telnet
                     mode: Mode::Rfb,
                     username: Some("user".into()),
                     tunnel: Some("me@jump:2222".into()),
-                    generic: false,
+                    ..Default::default()
                 },
                 Connection {
                     name: "pi".into(),
                     host: "192.168.50.56".into(),
                     port: 5901,
                     mode: Mode::Rfb,
-                    username: None,
-                    tunnel: None,
                     generic: true,
+                    favorite: true,
+                    ..Default::default()
                 },
             ]
         );
@@ -228,9 +234,7 @@ unknownmode    host           5900   telnet
                 host: "192.168.1.50".into(),
                 port: 35390,
                 mode: Mode::Native,
-                username: None,
-                tunnel: None,
-                generic: false,
+                ..Default::default()
             },
             Connection {
                 name: "pi".into(),
@@ -240,6 +244,7 @@ unknownmode    host           5900   telnet
                 username: Some("jack".into()),
                 tunnel: Some("me@jump:2222".into()),
                 generic: true,
+                favorite: true,
             },
         ];
         // The header is a comment, so parse ignores it; every field survives the round trip.

@@ -5,5 +5,5 @@
 pub mod bar;
 pub mod config;
 pub mod draw;
-pub mod picker;
+pub mod manager;
 pub mod tunnel;

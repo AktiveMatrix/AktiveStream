@@ -11,8 +11,10 @@ mod event_tap;
 mod keys;
 #[cfg(feature = "native")]
 mod native;
+mod secret;
 
-use aktivestream_client::{bar, config, picker, tunnel};
+use aktivestream_client::manager::{self, Manager, Outcome};
+use aktivestream_client::{bar, config, tunnel};
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -32,7 +34,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -683,15 +685,14 @@ impl ApplicationHandler<()> for App {
     }
 }
 
-/// Connects, decodes the first framebuffer update, writes it to a PNG, and exits. Lets us verify
-/// the RFB pipeline on Linux without a display server or a screenshot tool.
-/// The connection picker window, shown when the client starts with no target. On a choice it
-/// launches `aktivestream <name>` as a fresh process (its own session window) and closes, so the
-/// picker and the session never share a winit event loop.
+/// The connection manager window, shown when the client starts with no target. It drives the shared
+/// [`Manager`] (list with search and favorites, add/edit form, delete), stores passwords in the OS
+/// keyring, and on a choice launches `aktivestream <name>` as a fresh process (its own session
+/// window) and closes, so the manager and the session never share a winit event loop.
 struct PickerApp {
-    entries: Vec<config::Connection>,
-    selected: usize,
+    manager: Manager,
     cursor: (f64, f64),
+    modifiers: ModifiersState,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     chosen: Option<String>,
@@ -712,7 +713,7 @@ impl PickerApp {
         let Ok(mut buffer) = surface.buffer_mut() else {
             return;
         };
-        picker::draw_picker(&mut buffer, dw.get() as usize, dh.get() as usize, &self.entries, self.selected);
+        self.manager.draw(&mut buffer, dw.get() as usize, dh.get() as usize);
         let _ = buffer.present();
     }
 
@@ -720,22 +721,60 @@ impl PickerApp {
         self.window.as_ref().map_or(0, |w| w.inner_size().height as usize)
     }
 
-    fn step(&mut self, delta: isize) {
-        if self.entries.is_empty() {
-            return;
-        }
-        let n = self.entries.len() as isize;
-        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+    fn request_redraw(&self) {
         if let Some(w) = &self.window {
             w.request_redraw();
         }
     }
 
-    fn choose(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(c) = self.entries.get(self.selected) {
-            self.chosen = Some(c.name.clone());
+    /// Acts on a manager outcome: launch and close, quit, persist or forget a password, or repaint.
+    fn apply(&mut self, outcome: Outcome, event_loop: &ActiveEventLoop) {
+        match outcome {
+            Outcome::Redraw => self.request_redraw(),
+            Outcome::Idle => {}
+            Outcome::Connect(name) => {
+                self.chosen = Some(name);
+                event_loop.exit();
+            }
+            Outcome::Quit => event_loop.exit(),
+            Outcome::StorePassword { host, username, password } => {
+                secret::store(&host, &username, &password);
+                self.request_redraw();
+            }
+            Outcome::ForgetPassword { host } => {
+                secret::forget(&host);
+                self.request_redraw();
+            }
         }
-        event_loop.exit();
+    }
+
+    /// Maps a winit key press to a manager event. Named keys and Ctrl chords map directly; printable
+    /// typing is left to the caller, which replays `event.text` character by character.
+    fn key_event(&self, event: &KeyEvent) -> Option<manager::KeyEvent> {
+        use manager::KeyCode as K;
+        let ctrl = self.modifiers.control_key();
+        let code = match &event.logical_key {
+            Key::Named(NamedKey::ArrowUp) => K::Up,
+            Key::Named(NamedKey::ArrowDown) => K::Down,
+            Key::Named(NamedKey::ArrowLeft) => K::Left,
+            Key::Named(NamedKey::ArrowRight) => K::Right,
+            Key::Named(NamedKey::Enter) => K::Enter,
+            Key::Named(NamedKey::Escape) => K::Escape,
+            Key::Named(NamedKey::Backspace) => K::Backspace,
+            Key::Named(NamedKey::Delete) => K::Delete,
+            Key::Named(NamedKey::Tab) => {
+                return Some(if self.modifiers.shift_key() {
+                    manager::KeyEvent::new(K::BackTab)
+                } else {
+                    manager::KeyEvent::new(K::Tab)
+                });
+            }
+            Key::Character(s) if ctrl => {
+                return s.chars().next().map(|c| manager::KeyEvent::ctrl(K::Char(c.to_ascii_lowercase())));
+            }
+            _ => return None,
+        };
+        Some(manager::KeyEvent::new(code))
     }
 }
 
@@ -744,10 +783,8 @@ impl ApplicationHandler<()> for PickerApp {
         if self.window.is_some() {
             return;
         }
-        let rows = self.entries.len().max(1);
-        let height = (picker::TOP + rows * picker::ROW_H + 24).min(760) as f64;
         let attrs =
-            Window::default_attributes().with_title("AktiveStream").with_inner_size(LogicalSize::new(680.0, height));
+            Window::default_attributes().with_title("AktiveStream").with_inner_size(LogicalSize::new(760.0, 680.0));
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Rc::new(w),
             Err(e) => {
@@ -772,37 +809,24 @@ impl ApplicationHandler<()> for PickerApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Resized(_) => {
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x, position.y);
-                if let Some(idx) = picker::row_at(self.cursor, self.window_height(), self.entries.len())
-                    && idx != self.selected
-                {
-                    self.selected = idx;
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
-            }
+            WindowEvent::Resized(_) => self.request_redraw(),
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => self.cursor = (position.x, position.y),
             WindowEvent::MouseInput { state: ElementState::Pressed, button: WinitButton::Left, .. } => {
-                if let Some(idx) = picker::row_at(self.cursor, self.window_height(), self.entries.len()) {
-                    self.selected = idx;
-                    self.choose(event_loop);
-                }
+                let outcome = self.manager.click(self.cursor.0 as i32, self.cursor.1 as i32, self.window_height());
+                self.apply(outcome, event_loop);
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    use winit::keyboard::KeyCode;
-                    match code {
-                        KeyCode::ArrowDown => self.step(1),
-                        KeyCode::ArrowUp => self.step(-1),
-                        KeyCode::Enter | KeyCode::NumpadEnter => self.choose(event_loop),
-                        KeyCode::Escape => event_loop.exit(),
-                        _ => {}
+                if let Some(ev) = self.key_event(&event) {
+                    let outcome = self.manager.key(ev);
+                    self.apply(outcome, event_loop);
+                } else if !self.modifiers.control_key()
+                    && let Some(text) = event.text.clone()
+                {
+                    // Printable typing (search box and text fields), replayed character by character.
+                    for c in text.chars().filter(|c| !c.is_control()) {
+                        let outcome = self.manager.key(manager::KeyEvent::new(manager::KeyCode::Char(c)));
+                        self.apply(outcome, event_loop);
                     }
                 }
             }
@@ -811,10 +835,17 @@ impl ApplicationHandler<()> for PickerApp {
     }
 }
 
-/// Shows the connection picker; on a choice, launches `aktivestream <name>` as a fresh process.
+/// Shows the connection manager; on a choice, launches `aktivestream <name>` as a fresh process.
 fn run_picker(entries: Vec<config::Connection>) -> Result<(), String> {
     let event_loop = EventLoop::<()>::with_user_event().build().map_err(|e| e.to_string())?;
-    let mut app = PickerApp { entries, selected: 0, cursor: (0.0, 0.0), window: None, surface: None, chosen: None };
+    let mut app = PickerApp {
+        manager: Manager::new(entries),
+        cursor: (0.0, 0.0),
+        modifiers: ModifiersState::empty(),
+        window: None,
+        surface: None,
+        chosen: None,
+    };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     if let Some(name) = app.chosen {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -901,44 +932,54 @@ fn bar_preview(path: &str) -> Result<(), String> {
     writer.write_image_data(&rgb).map_err(|e| e.to_string())
 }
 
-/// Headless render of the connection picker to a PNG (AKTIVE_PICKER_PREVIEW), for verifying its
-/// layout without a display. Uses the saved phone book, or a sample list when it is empty.
+/// Headless render of the connection manager to PNGs (AKTIVE_PICKER_PREVIEW), for verifying its
+/// layout without a display: the list view to `<path>` and the edit form to `<path>-form.png`.
+/// Uses the saved phone book, or a sample list when it is empty.
 fn picker_preview(path: &str) -> Result<(), String> {
     use config::{Connection, Mode};
+    use manager::{KeyCode, KeyEvent, Manager};
     let mut entries = config::load();
     if entries.is_empty() {
-        let sample = |name: &str, host: &str, port: u16, mode: Mode| Connection {
+        let sample = |name: &str, host: &str, port: u16, mode: Mode, generic: bool, favorite: bool| Connection {
             name: name.into(),
             host: host.into(),
             port,
             mode,
-            username: None,
-            tunnel: None,
-            generic: false,
+            generic,
+            favorite,
+            ..Default::default()
         };
         entries = vec![
-            sample("studio", "mac-studio.local", 5900, Mode::Native),
-            sample("air", "192.168.1.50", 5900, Mode::Rfb),
-            sample("work-mac", "10.0.0.9", 5900, Mode::Rfb),
+            sample("studio", "mac-studio.local", 5900, Mode::Native, false, true),
+            sample("pi", "192.168.50.56", 5901, Mode::Rfb, true, false),
+            sample("air", "192.168.1.50", 5900, Mode::Rfb, false, false),
+            sample("work-mac", "10.0.0.9", 5900, Mode::Rfb, false, false),
         ];
     }
-    let w = 680usize;
-    let h = (picker::TOP + entries.len() * picker::ROW_H + 24).min(760);
-    let mut buf = vec![0u32; w * h];
-    picker::draw_picker(&mut buf, w, h, &entries, 0);
-
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
-    encoder.set_color(png::ColorType::Rgb);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for p in &buf {
-        rgb.push((p >> 16) as u8);
-        rgb.push((p >> 8) as u8);
-        rgb.push(*p as u8);
-    }
-    writer.write_image_data(&rgb).map_err(|e| e.to_string())
+    let (w, h) = (760usize, 680usize);
+    let write = |m: &Manager, path: &str| -> Result<(), String> {
+        let mut buf = vec![0u32; w * h];
+        m.draw(&mut buf, w, h);
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for p in &buf {
+            rgb.push((p >> 16) as u8);
+            rgb.push((p >> 8) as u8);
+            rgb.push(*p as u8);
+        }
+        writer.write_image_data(&rgb).map_err(|e| e.to_string())
+    };
+    // List view, then an edit form opened on the second row (navigation does not persist).
+    let mut m = Manager::new(entries);
+    write(&m, path)?;
+    m.key(KeyEvent::new(KeyCode::Down));
+    m.key(KeyEvent::ctrl(KeyCode::Char('e')));
+    let form_path = path.strip_suffix(".png").map_or_else(|| format!("{path}-form"), |b| format!("{b}-form.png"));
+    write(&m, &form_path)
 }
 
 fn main() -> Result<(), String> {
@@ -1060,7 +1101,9 @@ fn main() -> Result<(), String> {
         );
     }
 
-    // RFB path, optionally through an SSH tunnel. Keep the tunnel alive for the session.
+    // RFB path, optionally through an SSH tunnel. Keep the tunnel alive for the session. The stored
+    // password is keyed by the real host, not the tunnel's 127.0.0.1.
+    let secret_host = host.clone();
     let tunnel_guard: Option<tunnel::Tunnel>;
     let (rfb_host, rfb_port) = if let Some(spec) = &tunnel {
         let active = tunnel::open(spec, &host, port)?;
@@ -1072,7 +1115,7 @@ fn main() -> Result<(), String> {
         (host, port)
     };
     let username = saved_user.or_else(|| std::env::var("RFB_USER").ok());
-    let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
+    let password = secret::load(&secret_host).or_else(|| std::env::var("RFB_PASSWORD").ok()).unwrap_or_default();
     let options = rfb_options(rfb_host, rfb_port, username, password);
 
     // Headless verification modes (single session only).
@@ -1114,6 +1157,7 @@ fn connect_rfb(target: &str, tunnel_flag: &Option<String>) -> Result<(Session, S
         GENERIC.store(true, Ordering::Relaxed);
     }
     let tunnel = tunnel_flag.clone().or_else(|| saved.and_then(|c| c.tunnel));
+    let secret_host = host.clone();
     let tunnel_guard: Option<tunnel::Tunnel>;
     let (rfb_host, rfb_port) = if let Some(spec) = &tunnel {
         let active = tunnel::open(spec, &host, port)?;
@@ -1124,7 +1168,7 @@ fn connect_rfb(target: &str, tunnel_flag: &Option<String>) -> Result<(Session, S
         tunnel_guard = None;
         (host, port)
     };
-    let password = std::env::var("RFB_PASSWORD").unwrap_or_default();
+    let password = secret::load(&secret_host).or_else(|| std::env::var("RFB_PASSWORD").ok()).unwrap_or_default();
     let options = rfb_options(rfb_host, rfb_port, username, password);
     let (info, reader, writer) = connect(&options).map_err(|e| format!("connect {target}: {e}"))?;
     eprintln!("connected to {} ({}x{})", info.name, info.width, info.height);

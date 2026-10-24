@@ -33,11 +33,21 @@ arboard = { version = "3", default-features = false }
 # native path with `--features native` on a Linux box that has ffmpeg's dev libraries.
 ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "software-scaling"], optional = true }
 
+# Password storage for the connection manager, in the OS keyring. Backend selected per platform so
+# a non-native target never pulls another platform's system crates. Pure-Rust crypto on Linux
+# (no OpenSSL); the Secret Service / Keychain / Credential Manager handle persistence.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
 # macOS event tap: capture system keyboard shortcuts (Cmd+Tab) that winit never receives and
 # forward them to the remote Mac. Same major versions winit/softbuffer already pull in on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.23"
 core-foundation = "0.9"
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
 
 [features]
 native = ["dep:ffmpeg-next"]
