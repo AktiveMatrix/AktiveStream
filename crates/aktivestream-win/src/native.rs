@@ -69,53 +69,62 @@ async fn session(
     let (info, mut send, mut recv) = control.into_parts();
     let name = info.name;
 
-    let mut active: Option<(Decoder, Arc<Shared>)> = None;
-    loop {
-        tokio::select! {
-            // Video from the host.
-            message = read_message(&mut recv) => {
-                let message = match message {
-                    Ok(m) => m,
-                    Err(e) => { fail(&active, &e.to_string()); return Err(e.to_string()); }
-                };
-                match message {
-                    Some(Message::VideoStart(start)) => {
-                        video_init().map_err(|e| e.to_string())?;
-                        let codec = if start.codec == 1 { Codec::H264 } else { Codec::Hevc };
-                        let decoder = Decoder::new(codec, start.width, start.height).map_err(|e| e.to_string())?;
-                        info_tx.send(Ok((start.width, start.height, name.clone()))).map_err(|_| "window gone")?;
-                        let shared = shared_rx.recv().map_err(|_| "window gone".to_string())?;
-                        active = Some((decoder, shared));
-                    }
-                    Some(Message::VideoFrame(frame)) => {
-                        if let Some((decoder, shared)) = active.as_mut() {
-                            match decoder.decode(&frame.data) {
-                                Ok(frames) => {
-                                    for decoded in frames {
-                                        shared.present_decoded(decoded.width, decoded.height, &decoded.rgba);
-                                    }
-                                }
-                                Err(e) => { shared.report_error(format!("Connection lost: {e}")); return Err(e.to_string()); }
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        if let Some((_, shared)) = &active { shared.disconnect(); }
-                        break;
-                    }
-                }
-            }
-            // Input to the host.
-            Some(input) = input_rx.recv() => {
-                if let Err(e) = write_input(&mut send, &input).await {
-                    fail(&active, &e.to_string());
-                    return Err(e.to_string());
-                }
+    // Serialize input writes onto `send` from one task, so the read loop can await read_message
+    // directly instead of inside a select!. read_message is not cancellation-safe: a select! that
+    // drops it mid-read (the instant an input event arrives) discards bytes already taken off the
+    // stream and desyncs the next video message's length prefix.
+    let forwarder = tokio::spawn(async move {
+        while let Some(input) = input_rx.recv().await {
+            if write_input(&mut send, &input).await.is_err() {
+                break;
             }
         }
-    }
-    Ok(())
+    });
+
+    let mut active: Option<(Decoder, Arc<Shared>)> = None;
+    let result = loop {
+        let message = match read_message(&mut recv).await {
+            Ok(m) => m,
+            Err(e) => { fail(&active, &e.to_string()); break Err(e.to_string()); }
+        };
+        match message {
+            Some(Message::VideoStart(start)) => {
+                if let Err(e) = video_init() { break Err(e.to_string()); }
+                let codec = if start.codec == 1 { Codec::H264 } else { Codec::Hevc };
+                let decoder = match Decoder::new(codec, start.width, start.height) {
+                    Ok(d) => d,
+                    Err(e) => break Err(e.to_string()),
+                };
+                if info_tx.send(Ok((start.width, start.height, name.clone()))).is_err() {
+                    break Err("window gone".to_string());
+                }
+                let shared = match shared_rx.recv() {
+                    Ok(s) => s,
+                    Err(_) => break Err("window gone".to_string()),
+                };
+                active = Some((decoder, shared));
+            }
+            Some(Message::VideoFrame(frame)) => {
+                if let Some((decoder, shared)) = active.as_mut() {
+                    match decoder.decode(&frame.data) {
+                        Ok(frames) => {
+                            for decoded in frames {
+                                shared.present_decoded(decoded.width, decoded.height, &decoded.rgba);
+                            }
+                        }
+                        Err(e) => { shared.report_error(format!("Connection lost: {e}")); break Err(e.to_string()); }
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some((_, shared)) = &active { shared.disconnect(); }
+                break Ok(());
+            }
+        }
+    };
+    forwarder.abort();
+    result
 }
 
 fn fail(active: &Option<(Decoder, Arc<Shared>)>, error: &str) {
