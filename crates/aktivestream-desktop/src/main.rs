@@ -914,6 +914,7 @@ fn picker_preview(path: &str) -> Result<(), String> {
             mode,
             username: None,
             tunnel: None,
+            generic: false,
         };
         entries = vec![
             sample("studio", "mac-studio.local", 5900, Mode::Native),
@@ -1020,6 +1021,9 @@ fn main() -> Result<(), String> {
     let use_native = native_flag || saved.as_ref().is_some_and(|c| c.mode == config::Mode::Native);
     let port = host_port.unwrap_or(if use_native { 35390 } else { 5900 });
     let saved_user = saved.as_ref().and_then(|c| c.username.clone());
+    if saved.as_ref().is_some_and(|c| c.generic) {
+        GENERIC.store(true, Ordering::Relaxed);
+    }
     let tunnel = tunnel_flag.or_else(|| saved.and_then(|c| c.tunnel));
 
     // Native path (QUIC + hardware video decode): windowed (saved `native` mode or `--native`), or
@@ -1106,6 +1110,9 @@ fn connect_rfb(target: &str, tunnel_flag: &Option<String>) -> Result<(Session, S
         },
     };
     let username = saved.as_ref().and_then(|c| c.username.clone()).or_else(|| std::env::var("RFB_USER").ok());
+    if saved.as_ref().is_some_and(|c| c.generic) {
+        GENERIC.store(true, Ordering::Relaxed);
+    }
     let tunnel = tunnel_flag.clone().or_else(|| saved.and_then(|c| c.tunnel));
     let tunnel_guard: Option<tunnel::Tunnel>;
     let (rfb_host, rfb_port) = if let Some(spec) = &tunnel {

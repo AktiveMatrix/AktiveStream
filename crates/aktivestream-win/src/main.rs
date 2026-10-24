@@ -113,8 +113,8 @@ fn parse_args() -> Result<Args, String> {
     let target = host.ok_or_else(|| USAGE.to_string())?;
     // Phone book: a saved connection name resolves to its host/port/mode/user/tunnel; otherwise
     // the argument is a host[:port].
-    let (host, port, saved_native, saved_user, saved_tunnel) = match config::find(&target) {
-        Some(c) => (c.host, c.port, c.mode == config::Mode::Native, c.username, c.tunnel),
+    let (host, port, saved_native, saved_user, saved_tunnel, saved_generic) = match config::find(&target) {
+        Some(c) => (c.host, c.port, c.mode == config::Mode::Native, c.username, c.tunnel, c.generic),
         None => {
             let (h, p) = match target.rsplit_once(':') {
                 Some((h, p)) if !h.contains(':') => {
@@ -122,12 +122,13 @@ fn parse_args() -> Result<Args, String> {
                 }
                 _ => (target, 5900),
             };
-            (h, p, false, None, None)
+            (h, p, false, None, None, false)
         }
     };
     let native = native || saved_native;
     let user = user.or(saved_user);
     let tunnel = tunnel.or(saved_tunnel);
+    let generic = generic || saved_generic;
     Ok(Args {
         host,
         extra_hosts,

@@ -86,7 +86,15 @@ mod tests {
     use super::*;
 
     fn conn(name: &str) -> Connection {
-        Connection { name: name.into(), host: "h".into(), port: 5900, mode: Mode::Rfb, username: None, tunnel: None }
+        Connection {
+            name: name.into(),
+            host: "h".into(),
+            port: 5900,
+            mode: Mode::Rfb,
+            username: None,
+            tunnel: None,
+            generic: false,
+        }
     }
 
     #[test]
