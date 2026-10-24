@@ -18,6 +18,12 @@ num-bigint = "0.4"
 # Classic VNC auth (security type 2) uses single DES.
 des = "0.8"
 getrandom = "0.3"
+# RealVNC RSA-AES auth (security types 5/6/13): RSA key exchange, then an AES-128-EAX framed
+# session. `rsa` does the key generation + PKCS#1 v1.5; `eax` is the AEAD; SHA-1 derives the keys.
+rsa = "0.9"
+rand = "0.8"
+sha1 = "0.10"
+eax = "0.5"
 
 [dev-dependencies]
 # Saves the first frame in examples/smoke.rs.

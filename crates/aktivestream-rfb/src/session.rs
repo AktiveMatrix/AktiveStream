@@ -1,23 +1,73 @@
 //! Handshake and the server-message loop.
 
 use std::collections::VecDeque;
-use std::io::{BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{self, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use crate::decode::{self, Inflater};
+use crate::ra2::{self, Ra2Cipher, Ra2Reader, Ra2Writer};
 use crate::wire::{self, CountingReader, read_i32, read_into, read_string, read_u8, read_u16, read_u32};
 use crate::{
     ConnectOptions, Encoding, Error, Framebuffer, PixelFormat, ReaderStats, Rect, Result, SecurityType, ServerEvent,
     ServerInfo, SessionReader, SessionWriter, auth,
 };
 
+/// The reading half of a session's socket: plain, or RA2 AES-EAX framed. The RFB reader and the
+/// handshake use it through [`Read`]; the stream cipher is transparent.
+pub(crate) enum ReadHalf {
+    Plain(TcpStream),
+    Ra2(Ra2Reader<TcpStream>),
+}
+
+impl Read for ReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ReadHalf::Plain(s) => s.read(buf),
+            ReadHalf::Ra2(r) => r.read(buf),
+        }
+    }
+}
+
+/// The writing half of a session's socket: plain, or RA2 AES-EAX framed.
+pub(crate) enum WriteHalf {
+    Plain(TcpStream),
+    Ra2(Ra2Writer<TcpStream>),
+}
+
+impl Write for WriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            WriteHalf::Plain(s) => s.write(buf),
+            WriteHalf::Ra2(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            WriteHalf::Plain(s) => s.flush(),
+            WriteHalf::Ra2(w) => w.flush(),
+        }
+    }
+}
+
+impl WriteHalf {
+    /// Closes the underlying socket in both directions, so the reader's next read fails.
+    pub(crate) fn shutdown(&self) {
+        let sock = match self {
+            WriteHalf::Plain(s) => s,
+            WriteHalf::Ra2(w) => w.get_ref(),
+        };
+        let _ = sock.shutdown(Shutdown::Both);
+    }
+}
+
 pub(crate) fn lock(fb: &Mutex<Framebuffer>) -> MutexGuard<'_, Framebuffer> {
     fb.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) fn send(out: &Mutex<TcpStream>, msg: &[u8]) -> Result<()> {
+pub(crate) fn send(out: &Mutex<WriteHalf>, msg: &[u8]) -> Result<()> {
     let mut s = out.lock().unwrap_or_else(|e| e.into_inner());
     s.write_all(msg)?;
     Ok(())
@@ -43,24 +93,32 @@ fn parse_version(v: &[u8; 12]) -> Result<(String, u32)> {
         (true, Some(major), Some(minor)) => (major, minor),
         _ => return Err(Error::Protocol(text)),
     };
-    if major != 3 {
-        return Err(Error::Protocol(text));
-    }
-    let spoken = match minor {
-        m if m >= 8 => 8,
-        7 => 7,
-        _ => 3,
+    // RealVNC announces RFB 004.x / 005.x for its own extensions; it accepts a 3.8 reply and then
+    // offers the RSA-AES (RA2) security types. Treat its versions, and any 3.8+, as 3.8.
+    let spoken = match (major, minor) {
+        (4 | 5, _) => 8,
+        (3, m) if m >= 8 => 8,
+        (3, 7) => 7,
+        (3, _) => 3,
+        _ => return Err(Error::Protocol(text)),
     };
     Ok((text.trim_end().to_owned(), spoken))
 }
 
-fn negotiate_security(s: &mut &TcpStream, options: &ConnectOptions, minor: u32) -> Result<SecurityType> {
+type Ra2Ciphers = (Ra2Cipher, Ra2Cipher);
+
+fn negotiate_security(
+    s: &mut &TcpStream,
+    options: &ConnectOptions,
+    minor: u32,
+) -> Result<(SecurityType, Option<Ra2Ciphers>)> {
     let chosen = if minor == 3 {
         let t = read_u32(s)?;
         let st = match t {
             0 => return Err(Error::AuthFailed(read_string(s)?)),
             1 => SecurityType::None,
             2 => SecurityType::VncAuth,
+            5 => SecurityType::RsaAes,
             _ => return Err(Error::NoSecurityType(vec![t as u8])),
         };
         if !options.security.contains(&st) {
@@ -88,21 +146,32 @@ fn negotiate_security(s: &mut &TcpStream, options: &ConnectOptions, minor: u32) 
         t
     };
 
-    match chosen {
-        SecurityType::None => {}
-        SecurityType::VncAuth => auth::vnc_auth(s, &options.password)?,
+    let ciphers = match chosen {
+        SecurityType::None => None,
+        SecurityType::VncAuth => {
+            auth::vnc_auth(s, &options.password)?;
+            None
+        }
         SecurityType::AppleDh => {
             let user = options.username.as_deref().ok_or(Error::UsernameRequired(30))?;
-            auth::apple_dh(s, user, &options.password)?
+            auth::apple_dh(s, user, &options.password)?;
+            None
         }
-    }
+        SecurityType::RsaAes => {
+            // RA2 may ask for a username (credential subtype 1); the handshake sends an empty one
+            // if the server does not need it (subtype 2).
+            let user = options.username.as_deref().unwrap_or("");
+            Some(ra2::handshake(s, user, &options.password)?)
+        }
+    };
 
-    // 3.8 always sends SecurityResult; older versions skip it for the None type.
-    if (minor >= 8 || chosen != SecurityType::None) && read_u32(s)? != 0 {
+    // Plaintext types read SecurityResult here (3.8 always; older skip it for the None type). RA2
+    // sends SecurityResult inside the encrypted stream, so the caller reads it once the cipher is set.
+    if ciphers.is_none() && (minor >= 8 || chosen != SecurityType::None) && read_u32(s)? != 0 {
         let reason = if minor >= 8 { read_string(s).ok() } else { None };
         return Err(Error::AuthFailed(reason.unwrap_or_else(|| "server rejected the credentials".into())));
     }
-    Ok(chosen)
+    Ok((chosen, ciphers))
 }
 
 fn parse_pixel_format(p: &[u8; 16]) -> PixelFormat {
@@ -137,30 +206,49 @@ pub(crate) fn connect(options: &ConnectOptions) -> Result<(ServerInfo, SessionRe
     };
     s.write_all(reply)?;
 
-    let security = negotiate_security(&mut s, options, minor)?;
+    let (security, ciphers) = negotiate_security(&mut s, options, minor)?;
 
-    s.write_all(&[options.shared as u8])?;
-    let width = read_u16(&mut s)?;
-    let height = read_u16(&mut s)?;
+    // Handshake done: drop the connect read timeout so the message loop can block, then split the
+    // socket into read/write halves (RA2 wraps each in its AES-EAX stream cipher).
+    stream.set_read_timeout(None)?;
+    let write_sock = stream.try_clone()?;
+    let (mut read_half, mut write_half) = match ciphers {
+        Some((c2s, s2c)) => {
+            (ReadHalf::Ra2(Ra2Reader::new(stream, s2c)), WriteHalf::Ra2(Ra2Writer::new(write_sock, c2s)))
+        }
+        None => (ReadHalf::Plain(stream), WriteHalf::Plain(write_sock)),
+    };
+
+    // RA2 carries SecurityResult inside the encrypted stream; plaintext types already consumed it.
+    if security == SecurityType::RsaAes && read_u32(&mut read_half)? != 0 {
+        let reason = read_string(&mut read_half).ok();
+        return Err(Error::AuthFailed(reason.unwrap_or_else(|| "server rejected the credentials".into())));
+    }
+
+    write_half.write_all(&[options.shared as u8])?;
+    let width = read_u16(&mut read_half)?;
+    let height = read_u16(&mut read_half)?;
     let mut pf = [0u8; 16];
-    s.read_exact(&mut pf)?;
-    let name = read_string(&mut s)?;
+    read_half.read_exact(&mut pf)?;
+    let name = read_string(&mut read_half)?;
 
     let full = Rect { x: 0, y: 0, w: width, h: height };
     let mut setup = Vec::with_capacity(64);
     setup.extend_from_slice(&wire::set_pixel_format());
     setup.extend_from_slice(&wire::set_encodings(&options.encodings));
-    if options.sync_clipboard {
+    // "Auto pasteboard" (client message 0x15) is an Apple Screen Sharing extension. A RealVNC server
+    // (RSA-AES auth) rejects it as an unknown message and drops the connection, so skip it there; Mac
+    // Screen Sharing understands it over both Apple DH and its VNC-auth fallback.
+    if options.sync_clipboard && security != SecurityType::RsaAes {
         setup.extend_from_slice(&wire::set_autopasteboard(1));
     }
     setup.extend_from_slice(&wire::update_request(false, full));
-    s.write_all(&setup)?;
+    write_half.write_all(&setup)?;
 
-    stream.set_read_timeout(None)?;
-    let out = Arc::new(Mutex::new(stream.try_clone()?));
+    let out = Arc::new(Mutex::new(write_half));
     let info = ServerInfo { protocol, security, width, height, name, server_pixel_format: parse_pixel_format(&pf) };
     let reader = SessionReader {
-        input: BufReader::with_capacity(1 << 20, CountingReader { inner: stream, count: 0 }),
+        input: BufReader::with_capacity(1 << 20, CountingReader { inner: read_half, count: 0 }),
         out: Arc::clone(&out),
         width,
         height,

@@ -13,12 +13,12 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::BufReader;
-use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod auth;
 mod decode;
+mod ra2;
 mod session;
 mod wire;
 
@@ -81,6 +81,8 @@ impl Encoding {
 pub enum SecurityType {
     None = 1,
     VncAuth = 2,
+    /// RealVNC RSA-AES (type 5): RSA key exchange, then an AES-128-EAX encrypted session.
+    RsaAes = 5,
     AppleDh = 30,
 }
 
@@ -112,7 +114,7 @@ impl ConnectOptions {
             port,
             username,
             password: password.into(),
-            security: vec![SecurityType::AppleDh, SecurityType::VncAuth],
+            security: vec![SecurityType::AppleDh, SecurityType::VncAuth, SecurityType::RsaAes],
             encodings: Encoding::DEFAULT.to_vec(),
             shared: true,
             sync_clipboard: true,
@@ -233,8 +235,8 @@ pub struct ReaderStats {
 /// and [`SessionWriter`] share the socket's write half behind a mutex; every message is
 /// serialized first and written with one `write_all` under that lock.
 pub struct SessionReader {
-    input: BufReader<wire::CountingReader<TcpStream>>,
-    out: Arc<Mutex<TcpStream>>,
+    input: BufReader<wire::CountingReader<session::ReadHalf>>,
+    out: Arc<Mutex<session::WriteHalf>>,
     /// Current remote desktop size (changes with DesktopSize).
     width: u16,
     height: u16,
@@ -279,7 +281,7 @@ impl SessionReader {
 /// a side channel (e.g. a clipboard poller) can send too; the shared lock keeps messages whole.
 #[derive(Clone)]
 pub struct SessionWriter {
-    out: Arc<Mutex<TcpStream>>,
+    out: Arc<Mutex<session::WriteHalf>>,
 }
 
 impl SessionWriter {
@@ -305,6 +307,6 @@ impl SessionWriter {
     /// Closes the connection; the reader's next read fails.
     pub fn shutdown(&self) {
         let s = self.out.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = s.shutdown(std::net::Shutdown::Both);
+        s.shutdown();
     }
 }
