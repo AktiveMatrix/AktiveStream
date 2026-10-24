@@ -19,12 +19,27 @@ enum MsgKind {
     static let inputKey: UInt8 = 30
     static let inputPointer: UInt8 = 31
     static let inputScroll: UInt8 = 32
+    static let setResolution: UInt8 = 33
 }
 
 /// How many synthetic frames `serve` streams before closing (checkpoint 2c).
 let streamFrameCount = 150
 
 enum SessionError: Error { case closed, tooLarge }
+
+/// Shares a pending resolution request from the input task (which reads SET_RESOLUTION) to the
+/// video task (which owns the display mode, encoder and capture). The video task drains it.
+final class StreamControl: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: (Int, Int)?
+    func request(_ w: Int, _ h: Int) {
+        lock.lock(); pending = (w, h); lock.unlock()
+    }
+    func take() -> (Int, Int)? {
+        lock.lock(); defer { pending = nil; lock.unlock() }
+        return pending
+    }
+}
 
 /// Receives exactly `n` bytes (QUIC is a reliable byte stream, so min==max returns all `n`).
 func receiveExact(_ connection: NWConnection, _ n: Int) async throws -> Data {
@@ -119,9 +134,10 @@ func runSession(_ connection: NWConnection) async {
         // Stream video (host->client) and read input (client->host) concurrently on the
         // same QUIC stream; either ending (a disconnect) ends the session.
         let box = SendableBox(value: connection)
+        let control = StreamControl()
         await withTaskGroup(of: Void.self) { group in
-            group.addTask { try? await streamVideo(box.value) }
-            group.addTask { await readInput(box.value) }
+            group.addTask { try? await streamVideo(box.value, control) }
+            group.addTask { await readInput(box.value, control) }
             await group.next()
             group.cancelAll()
         }
@@ -130,60 +146,99 @@ func runSession(_ connection: NWConnection) async {
     }
 }
 
-/// Streams HEVC over the control stream: the real screen when Screen Recording is granted,
-/// otherwise synthetic frames (so the pipeline runs without the grant, e.g. over SSH).
-func streamVideo(_ connection: NWConnection) async throws {
-    let w = 1920, h = 1200, fps = 60
+/// Sends a VIDEO_START announcing the codec and the dimensions the client's decoder needs.
+func sendVideoStart(_ connection: NWConnection, _ w: Int, _ h: Int) async throws {
     var start = Body()
     start.u32(UInt32(w))
     start.u32(UInt32(h))
     start.u8(0) // codec 0 = HEVC
     try await writeMessage(connection, kind: MsgKind.videoStart, body: start.data)
+}
 
-    let queue = FrameQueue()
-    let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { frame in
-        queue.append(frame)
+/// Drains the encoder's queued frames to the client.
+func flushFrames(_ queue: FrameQueue, _ connection: NWConnection) async throws {
+    for frame in queue.drain() {
+        var body = Body()
+        body.u8(frame.isKeyframe ? 1 : 0)
+        body.data.append(frame.data)
+        try await writeMessage(connection, kind: MsgKind.videoFrame, body: body.data)
     }
-    func flush() async throws {
-        for frame in queue.drain() {
-            var body = Body()
-            body.u8(frame.isKeyframe ? 1 : 0)
-            body.data.append(frame.data)
-            try await writeMessage(connection, kind: MsgKind.videoFrame, body: body.data)
-        }
-    }
+}
 
+/// Streams HEVC over the control stream: the real screen when Screen Recording is granted,
+/// otherwise synthetic frames (so the pipeline runs without the grant, e.g. over SSH). On the
+/// screen-capture path the stream follows the display's real mode and switches resolution when the
+/// client asks for one (SET_RESOLUTION), restarting the encoder and capture at the new size.
+func streamVideo(_ connection: NWConnection, _ control: StreamControl) async throws {
+    let fps = 60
+    let display = CGMainDisplayID()
     let scDisplay = try? await ScreenCapture.mainDisplay()
-    if let scDisplay, scDisplay.displayID == CGMainDisplayID() {
-        // The real main display is shareable (lid open / external attached): use ScreenCaptureKit,
-        // which is hardware-efficient and includes the cursor.
+
+    if let scDisplay, scDisplay.displayID == display {
+        // The real main display is shareable (lid open / external attached, or a dummy adapter in
+        // closed-display mode): use ScreenCaptureKit, hardware-efficient and with the cursor.
         log("session: streaming the main display via ScreenCaptureKit")
-        let capture = ScreenCapture(width: w, height: h) { pixelBuffer, ptsNanos in
-            try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
-        }
-        try await capture.start(display: scDisplay)
-        // Send frames as they arrive until the client disconnects (a send then throws).
-        do {
-            while true {
-                try await flush()
-                try await Task.sleep(nanoseconds: 5_000_000)
+        let originalMode = CGDisplayCopyDisplayMode(display)
+        var switched = false
+        // Leave the display on its original mode for the next client once this one switched it.
+        defer { if switched, let originalMode { DisplayModes.set(display, originalMode) } }
+
+        var (w, h) = DisplayModes.currentSize(display)
+        var currentDisplay = scDisplay
+        streamLoop: while true {
+            try await sendVideoStart(connection, w, h)
+            let queue = FrameQueue()
+            let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
+            let capture = ScreenCapture(width: w, height: h) { pixelBuffer, ptsNanos in
+                try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
             }
-        } catch {
-            log("session: capture stream ended (\(error))")
+            try await capture.start(display: currentDisplay)
+            var restart = false
+            do {
+                while true {
+                    try await flushFrames(queue, connection)
+                    // A pending client resolution request: switch to the nearest advertised mode.
+                    if let (rw, rh) = control.take(),
+                        let mode = DisplayModes.nearest(display, rw, rh),
+                        (mode.pixelWidth, mode.pixelHeight) != (w, h),
+                        let newSize = DisplayModes.set(display, mode) {
+                        log("session: client asked for \(rw)x\(rh); switched display to \(newSize.0)x\(newSize.1)")
+                        (w, h) = newSize
+                        switched = true
+                        restart = true
+                        break
+                    }
+                    try await Task.sleep(nanoseconds: 5_000_000)
+                }
+            } catch {
+                log("session: capture stream ended (\(error))")
+                await capture.stop()
+                encoder.finish()
+                break streamLoop
+            }
+            await capture.stop()
+            encoder.finish()
+            if !restart { break }
+            // Let the display and ScreenCaptureKit settle on the new mode before re-capturing.
+            try await Task.sleep(nanoseconds: 300_000_000)
+            currentDisplay = (try? await ScreenCapture.mainDisplay()) ?? currentDisplay
         }
-        await capture.stop()
-        encoder.finish()
-    } else if CGDisplayCreateImage(CGMainDisplayID()) != nil {
+    } else if CGDisplayCreateImage(display) != nil {
         // Clamshell / headless: ScreenCaptureKit won't share the off built-in main display, but the
-        // legacy framebuffer API grabs its composited desktop (as Screen Sharing does). Poll it.
+        // legacy framebuffer API grabs its composited desktop (as Screen Sharing does). Poll it at
+        // the display's real size (no dynamic resolution on this fallback path).
+        let (w, h) = DisplayModes.currentSize(display)
         log("session: streaming the main display via framebuffer capture")
-        let capture = FramebufferCapture(displayID: CGMainDisplayID(), width: w, height: h, fps: 30) { pixelBuffer, ptsNanos in
+        try await sendVideoStart(connection, w, h)
+        let queue = FrameQueue()
+        let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
+        let capture = FramebufferCapture(displayID: display, width: w, height: h, fps: 30) { pixelBuffer, ptsNanos in
             try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
         }
         capture.begin()
         do {
             while true {
-                try await flush()
+                try await flushFrames(queue, connection)
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
         } catch {
@@ -192,14 +247,18 @@ func streamVideo(_ connection: NWConnection) async throws {
         capture.stop()
         encoder.finish()
     } else {
+        let (w, h) = (1920, 1080)
         log("session: no capturable display; streaming synthetic frames")
+        try await sendVideoStart(connection, w, h)
+        let queue = FrameQueue()
+        let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
         for i in 0..<streamFrameCount {
             guard let pb = syntheticPixelBuffer(width: w, height: h, tick: i) else { continue }
             try encoder.encode(pb, ptsNanos: UInt64(i) * UInt64(1_000_000_000 / fps), forceKeyframe: i == 0)
-            try await flush()
+            try await flushFrames(queue, connection)
         }
         encoder.finish()
-        try await flush()
+        try await flushFrames(queue, connection)
         try await closeStream(connection)
         log("session: streamed \(streamFrameCount) synthetic frames")
     }

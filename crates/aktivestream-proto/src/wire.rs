@@ -20,6 +20,9 @@ pub mod kind {
     pub const INPUT_KEY: u8 = 30;
     pub const INPUT_POINTER: u8 = 31;
     pub const INPUT_SCROLL: u8 = 32;
+    /// client->host: ask the host to switch the streamed display to the mode nearest a `w`x`h`
+    /// pixel size (the client's current view). The host replies with a fresh VIDEO_START.
+    pub const SET_RESOLUTION: u8 = 33;
 }
 
 /// Largest single control/frame message accepted (a raw test frame can be a few MB).

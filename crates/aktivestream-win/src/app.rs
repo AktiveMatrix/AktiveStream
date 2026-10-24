@@ -42,8 +42,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowPlacement, HC_ACTION,
-    HCURSOR, HTCLIENT, HWND_TOP, IDC_ARROW, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LoadCursorW, MB_ICONERROR, MB_OK, MSG,
-    MessageBoxW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW, SC_KEYMENU, SW_SHOW,
+    HCURSOR, HTCLIENT, HWND_TOP, IDC_ARROW, KBDLLHOOKSTRUCT, KillTimer, LLKHF_EXTENDED, LoadCursorW, MB_ICONERROR,
+    MB_OK, MSG, MessageBoxW, PostMessageW, PostQuitMessage, PostThreadMessageW, RegisterClassExW, SC_KEYMENU, SW_SHOW,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     SetCursor, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
     SetWindowsHookExW, ShowWindow, TranslateMessage, UnhookWindowsHookEx, WA_INACTIVE, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
@@ -61,6 +61,9 @@ use crate::{Args, clipboard, cursor, diag};
 
 const WM_APP_LOCAL: u32 = WM_APP + 10;
 const TIMER_EXIT: usize = 1;
+/// Debounces window-resize notifications: each WM_SIZE restarts it, so the host gets one
+/// resolution request after the resize settles, not one per intermediate size.
+const TIMER_RESIZE: usize = 2;
 const LOCAL_FULLSCREEN: usize = 1;
 const LOCAL_TITLE: usize = 2;
 const LOCAL_DISCONNECT: usize = 3;
@@ -80,7 +83,7 @@ const WHEEL_DELTA: i32 = 120;
 #[derive(Clone)]
 enum Sink {
     Rfb(Sender<Out>),
-    Native(tokio::sync::mpsc::UnboundedSender<Input>),
+    Native(tokio::sync::mpsc::UnboundedSender<HostMsg>),
 }
 
 /// How keyboard events become wire events for the chosen backend.
@@ -92,7 +95,14 @@ enum KeyTranslator {
 /// Which backend a session uses, chosen at startup (RFB or the Phase 2 native host).
 pub enum Backend {
     Rfb,
-    Native(tokio::sync::mpsc::UnboundedSender<Input>),
+    Native(tokio::sync::mpsc::UnboundedSender<HostMsg>),
+}
+
+/// A message from the UI thread to the native host: translated input, or a resolution request sent
+/// when the window is resized (the host switches the streamed display to the nearest mode).
+pub enum HostMsg {
+    Input(Input),
+    Resize(u32, u32),
 }
 
 /// Keyboard state shared by the hook thread and the UI thread.
@@ -135,7 +145,11 @@ impl KeyState {
                 for event in events {
                     if let Some(k) = input.translate(event) {
                         if !view_only {
-                            let _ = tx.send(Input::Key { keycode: k.keycode, down: k.down, flags: k.flags });
+                            let _ = tx.send(HostMsg::Input(Input::Key {
+                                keycode: k.keycode,
+                                down: k.down,
+                                flags: k.flags,
+                            }));
                         }
                         sent.push((u32::from(k.keycode), k.down));
                     }
@@ -387,7 +401,11 @@ impl App {
                     let native = (buttons & 1)
                         | (if buttons & BUTTON_RIGHT != 0 { 2 } else { 0 })
                         | (if buttons & BUTTON_MIDDLE != 0 { 4 } else { 0 });
-                    let _ = tx.send(Input::Pointer { buttons: native, x: f32::from(x) / fw, y: f32::from(y) / fh });
+                    let _ = tx.send(HostMsg::Input(Input::Pointer {
+                        buttons: native,
+                        x: f32::from(x) / fw,
+                        y: f32::from(y) / fh,
+                    }));
                 }
                 // Key events go through KeyState for native; clipboard sync is not wired yet.
                 Out::Key(..) | Out::CutText(_) => {}
@@ -401,7 +419,19 @@ impl App {
 
     fn send_scroll(&self, dx: f32, dy: f32) {
         if let Sink::Native(tx) = &self.sink {
-            let _ = tx.send(Input::Scroll { dx, dy });
+            let _ = tx.send(HostMsg::Input(Input::Scroll { dx, dy }));
+        }
+    }
+
+    /// Asks the native host to switch the streamed display to the mode nearest the current client
+    /// size (sent when a resize finishes). The host gets as close as its display allows and the
+    /// view scaling covers the rest. No-op on the RFB path.
+    fn request_resolution(&self) {
+        if let Sink::Native(tx) = &self.sink {
+            let (w, h) = self.client_size();
+            if w > 0 && h > 0 {
+                let _ = tx.send(HostMsg::Resize(w as u32, h as u32));
+            }
         }
     }
 
@@ -930,6 +960,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            // After a user resize settles, ask the native host to match the resolution (debounced).
+            // Not for WM_APP_RESIZED, which is the host telling us it already switched.
+            if message == WM_SIZE && with_app(|app| app.is_native()) == Some(true) {
+                unsafe {
+                    SetTimer(Some(hwnd), TIMER_RESIZE, 400, None);
+                }
+            }
             return LRESULT(0);
         }
         net::WM_APP_FRAME => {
@@ -986,6 +1023,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == TIMER_RESIZE => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_RESIZE);
+            }
+            with_app(|app| app.request_resolution());
             return LRESULT(0);
         }
         WM_TIMER if wparam.0 == TIMER_EXIT => {

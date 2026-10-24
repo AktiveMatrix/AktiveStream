@@ -74,18 +74,25 @@ impl Shared {
     /// Writes a decoded RGBA frame into the framebuffer and schedules a repaint (the native
     /// path). RGBA bytes are packed into the framebuffer's `0x00RRGGBB` (BGRA in memory) layout.
     pub fn present_decoded(&self, width: u32, height: u32, rgba: &[u8]) {
-        {
+        let resized = {
             let mut fb = self.framebuffer.lock().unwrap();
-            if fb.width != width || fb.height != height {
+            let resized = fb.width != width || fb.height != height;
+            if resized {
                 fb.resize(width, height);
             }
             for (px, c) in fb.pixels.iter_mut().zip(rgba.as_chunks::<4>().0) {
                 *px = (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
             }
-        }
+            resized
+        };
         *self.dirty.lock().unwrap() = Some(Rect { x: 0, y: 0, w: width as u16, h: height as u16 });
         self.updates.fetch_add(1, Ordering::Relaxed);
         self.update_pixels.fetch_add(u64::from(width) * u64::from(height), Ordering::Relaxed);
+        // A resolution change (the host switched display modes) resizes the framebuffer; make the
+        // window re-fit the new size before the frame is drawn.
+        if resized {
+            self.post(WM_APP_RESIZED);
+        }
         if !self.frame_posted.swap(true, Ordering::AcqRel) {
             self.post(WM_APP_FRAME);
         }

@@ -88,12 +88,20 @@ final class InputInjector: @unchecked Sendable {
     }
 }
 
-/// Reads input messages from the connection and injects them, until the stream ends.
-func readInput(_ connection: NWConnection) async {
+/// Reads input messages from the connection and injects them, until the stream ends. Resolution
+/// requests are handed to `control` for the video task to act on.
+func readInput(_ connection: NWConnection, _ control: StreamControl) async {
     let injector = InputInjector()
     while true {
         guard let (kind, body) = try? await readMessage(connection) else { break }
-        injector.handle(kind: kind, body: body)
+        switch kind {
+        case MsgKind.setResolution:
+            var r = LeReader(body)
+            if let w = r.u32(), let h = r.u32() {
+                control.request(Int(w), Int(h))
+            }
+        default: injector.handle(kind: kind, body: body)
+        }
     }
 }
 

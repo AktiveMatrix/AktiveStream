@@ -223,6 +223,15 @@ pub async fn write_input(send: &mut quinn::SendStream, input: &Input) -> Result<
     wire::write_msg(send, kind, &body).await
 }
 
+/// Client -> host: request the streamed display switch to the mode nearest `width`x`height` pixels
+/// (the client's current view size). The host picks the closest mode its display advertises and
+/// replies with a fresh [`VideoStart`]; a host with no better match leaves the resolution as it is.
+pub async fn write_set_resolution(send: &mut quinn::SendStream, width: u32, height: u32) -> Result<()> {
+    let mut w = Writer::new();
+    w.u32(width).u32(height);
+    wire::write_msg(send, kind::SET_RESOLUTION, w.finish()).await
+}
+
 /// A message read from the control stream.
 #[derive(Debug)]
 pub enum Message {

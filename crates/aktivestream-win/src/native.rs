@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
 
-use aktivestream_proto::{DEFAULT_PORT, Input, Message, connect, read_message, write_input};
+use aktivestream_proto::{DEFAULT_PORT, Message, connect, read_message, write_input, write_set_resolution};
 use aktivestream_video::{Codec, Decoder, init as video_init};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 use crate::Args;
-use crate::app::{self, Backend};
+use crate::app::{self, Backend, HostMsg};
 use crate::net::Shared;
 
 /// Connects, learns the remote size, then runs the window with a background decode/input thread.
@@ -25,7 +25,7 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let (info_tx, info_rx) = mpsc::channel::<Result<(u32, u32, String), String>>();
     let (shared_tx, shared_rx) = mpsc::channel::<Arc<Shared>>();
-    let (input_tx, input_rx) = unbounded_channel::<Input>();
+    let (input_tx, input_rx) = unbounded_channel::<HostMsg>();
 
     thread::Builder::new()
         .name("native-session".into())
@@ -57,7 +57,7 @@ async fn session(
     password: String,
     info_tx: mpsc::Sender<Result<(u32, u32, String), String>>,
     shared_rx: mpsc::Receiver<Arc<Shared>>,
-    mut input_rx: UnboundedReceiver<Input>,
+    mut input_rx: UnboundedReceiver<HostMsg>,
 ) -> Result<(), String> {
     let socket = format!("{host}:{port}")
         .to_socket_addrs()
@@ -74,8 +74,12 @@ async fn session(
     // drops it mid-read (the instant an input event arrives) discards bytes already taken off the
     // stream and desyncs the next video message's length prefix.
     let forwarder = tokio::spawn(async move {
-        while let Some(input) = input_rx.recv().await {
-            if write_input(&mut send, &input).await.is_err() {
+        while let Some(msg) = input_rx.recv().await {
+            let r = match msg {
+                HostMsg::Input(input) => write_input(&mut send, &input).await,
+                HostMsg::Resize(w, h) => write_set_resolution(&mut send, w, h).await,
+            };
+            if r.is_err() {
                 break;
             }
         }
@@ -100,14 +104,25 @@ async fn session(
                     Ok(d) => d,
                     Err(e) => break Err(e.to_string()),
                 };
-                if info_tx.send(Ok((start.width, start.height, name.clone()))).is_err() {
-                    break Err("window gone".to_string());
+                match active.take() {
+                    None => {
+                        // First stream: hand the size to the window and take its shared framebuffer.
+                        if info_tx.send(Ok((start.width, start.height, name.clone()))).is_err() {
+                            break Err("window gone".to_string());
+                        }
+                        let shared = match shared_rx.recv() {
+                            Ok(s) => s,
+                            Err(_) => break Err("window gone".to_string()),
+                        };
+                        active = Some((decoder, shared));
+                    }
+                    Some((_, shared)) => {
+                        // Resolution switch mid-session: keep the window's framebuffer and swap the
+                        // decoder. The first frame at the new size resizes the framebuffer and the
+                        // window re-fits (Shared::present_decoded posts WM_APP_RESIZED on a change).
+                        active = Some((decoder, shared));
+                    }
                 }
-                let shared = match shared_rx.recv() {
-                    Ok(s) => s,
-                    Err(_) => break Err("window gone".to_string()),
-                };
-                active = Some((decoder, shared));
             }
             Some(Message::VideoFrame(frame)) => {
                 if let Some((decoder, shared)) = active.as_mut() {

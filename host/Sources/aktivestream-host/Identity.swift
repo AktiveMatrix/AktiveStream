@@ -54,10 +54,17 @@ func loadOrCreateIdentity() throws -> HostIdentity {
     let keychain = try openKeychain(at: keychainURL, password: passphrase)
     let data = try Data(contentsOf: p12URL)
     var items: CFArray?
-    let options: [String: Any] = [
+    var options: [String: Any] = [
         kSecImportExportPassphrase as String: passphrase,
         kSecImportExportKeychain as String: keychain,
     ]
+    // Import the key so any application may use it with no confirmation prompt. The agent runs in a
+    // headless GUI login session, where a keychain-access dialog is invisible and blocks the import
+    // forever (the TLS handshake then never completes and the agent never binds its port). The key
+    // still lives only in the agent's private, passphrase-locked keychain file in its support dir.
+    if let access = allowAllApplicationsAccess() {
+        options[kSecImportExportAccess as String] = access
+    }
     let status = SecPKCS12Import(data as CFData, options as CFDictionary, &items)
     guard status == errSecSuccess, let array = items as? [[String: Any]],
         let identityAny = array.first?[kSecImportItemIdentity as String]
@@ -70,6 +77,25 @@ func loadOrCreateIdentity() throws -> HostIdentity {
     disableAutoLock(keychain, password: passphrase)
     keepUnlocked(keychain, password: passphrase)
     return hostIdentity(from: identityAny as! SecIdentity)
+}
+
+/// A keychain access that lets any application use the imported key with no confirmation prompt, so
+/// a headless GUI-session agent never blocks on an invisible keychain-access dialog.
+private func allowAllApplicationsAccess() -> SecAccess? {
+    var access: SecAccess?
+    guard SecAccessCreate("AktiveStream Host" as CFString, nil, &access) == errSecSuccess, let access else {
+        return nil
+    }
+    var aclList: CFArray?
+    guard SecAccessCopyACLList(access, &aclList) == errSecSuccess, let acls = aclList as? [SecACL] else {
+        return access
+    }
+    for acl in acls {
+        // A nil trusted-application list trusts every application; an empty prompt selector means no
+        // confirmation dialog is ever shown for use of the key.
+        SecACLSetContents(acl, nil, "AktiveStream Host" as CFString, [])
+    }
+    return access
 }
 
 private func hostIdentity(from identity: SecIdentity) -> HostIdentity {
