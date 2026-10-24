@@ -85,11 +85,16 @@ async fn session(
     let result = loop {
         let message = match read_message(&mut recv).await {
             Ok(m) => m,
-            Err(e) => { fail(&active, &e.to_string()); break Err(e.to_string()); }
+            Err(e) => {
+                fail(&active, &e.to_string());
+                break Err(e.to_string());
+            }
         };
         match message {
             Some(Message::VideoStart(start)) => {
-                if let Err(e) = video_init() { break Err(e.to_string()); }
+                if let Err(e) = video_init() {
+                    break Err(e.to_string());
+                }
                 let codec = if start.codec == 1 { Codec::H264 } else { Codec::Hevc };
                 let decoder = match Decoder::new(codec, start.width, start.height) {
                     Ok(d) => d,
@@ -112,13 +117,18 @@ async fn session(
                                 shared.present_decoded(decoded.width, decoded.height, &decoded.rgba);
                             }
                         }
-                        Err(e) => { shared.report_error(format!("Connection lost: {e}")); break Err(e.to_string()); }
+                        Err(e) => {
+                            shared.report_error(format!("Connection lost: {e}"));
+                            break Err(e.to_string());
+                        }
                     }
                 }
             }
             Some(_) => {}
             None => {
-                if let Some((_, shared)) = &active { shared.disconnect(); }
+                if let Some((_, shared)) = &active {
+                    shared.disconnect();
+                }
                 break Ok(());
             }
         }
