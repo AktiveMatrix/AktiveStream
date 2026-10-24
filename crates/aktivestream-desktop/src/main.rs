@@ -35,6 +35,38 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Fullscreen, Window, WindowId};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether a remote screen smaller than the window is enlarged to fill it (default), aspect kept,
+/// or shown at 1:1, centred (`--no-scale-up`). Set once in `main`, read when an `App` is built.
+static SCALE_UP_FILL: AtomicBool = AtomicBool::new(true);
+
+/// Where the remote framebuffer sits in the window: scaled to fit with the aspect ratio kept and
+/// centred, enlarging past 1:1 to fill the window only when `scale_up` is set. The same geometry
+/// the Windows client's `View::fit_scaled` computes, in physical window pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ViewRect {
+    x: i64,
+    y: i64,
+    w: i64,
+    h: i64,
+}
+
+fn fit_view(fb_w: u32, fb_h: u32, win_w: u32, win_h: u32, scale_up: bool) -> ViewRect {
+    if fb_w == 0 || fb_h == 0 || win_w == 0 || win_h == 0 {
+        return ViewRect { x: 0, y: 0, w: 0, h: 0 };
+    }
+    let (fw, fh, ww, wh) = (i64::from(fb_w), i64::from(fb_h), i64::from(win_w), i64::from(win_h));
+    let (w, h) = if fw <= ww && fh <= wh && !scale_up {
+        (fw, fh)
+    } else if ww * fh <= wh * fw {
+        (ww, ww * fh / fw)
+    } else {
+        (wh * fw / fh, wh)
+    };
+    ViewRect { x: (ww - w) / 2, y: (wh - h) / 2, w, h }
+}
+
 /// Shared state between the RFB reader thread and the UI thread.
 /// The keyboard profile for this build: the macOS client drives a remote Mac from a Mac keyboard
 /// (identity), every other target drives it from a PC keyboard (the remap profile).
@@ -178,6 +210,8 @@ struct App {
     bar_shown: bool,
     /// Pixels per wheel notch for the native path (AKTIVESTREAM_SCROLL), as on Windows.
     scroll_px: f32,
+    /// Enlarge a framebuffer smaller than the window to fill it (default); off keeps 1:1, centred.
+    scale_up: bool,
     /// System shortcuts from the macOS event tap, drained on each UI wake-up.
     system_keys: SystemKeys,
     window: Option<Rc<Window>>,
@@ -241,6 +275,7 @@ impl App {
             fullscreen: false,
             bar_shown: false,
             scroll_px: scroll_px_from_env(),
+            scale_up: SCALE_UP_FILL.load(Ordering::Relaxed),
             system_keys: Arc::new(Mutex::new(VecDeque::new())),
             window: None,
             surface: None,
@@ -274,9 +309,13 @@ impl App {
         let (Some(shape), Some(window)) = (&self.sessions[self.active].cursor_shape, &self.window) else {
             return;
         };
-        let dw = f64::from(window.inner_size().width);
-        let sw = f64::from(self.sessions[self.active].shared.framebuffer.lock().unwrap().width);
-        let scale = if sw > 0.0 { dw / sw } else { 1.0 };
+        let size = window.inner_size();
+        let (sw, sh) = {
+            let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
+            (fb.width, fb.height)
+        };
+        let v = fit_view(sw, sh, size.width, size.height, self.scale_up);
+        let scale = if sw > 0 && v.w > 0 { v.w as f64 / f64::from(sw) } else { 1.0 };
         let Some((rgba, w, h, hx, hy)) = scaled_cursor_rgba(shape, scale) else {
             return;
         };
@@ -303,14 +342,16 @@ impl App {
 
         let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
         let (sw, sh) = (fb.width as usize, fb.height as usize);
-        if sw == 0 || sh == 0 {
-            buffer.fill(0);
-        } else {
-            for y in 0..dh {
-                let src_row = (y * sh / dh) * sw;
-                let dst_row = y * dw;
-                for x in 0..dw {
-                    buffer[dst_row + x] = fb.pixels[src_row + (x * sw / dw)] & 0x00ff_ffff;
+        // Scale to fit the window with the aspect ratio kept, centred; the margin stays black.
+        buffer.fill(0);
+        if sw != 0 && sh != 0 {
+            let v = fit_view(sw as u32, sh as u32, dw as u32, dh as u32, self.scale_up);
+            let (vx, vy, vw, vh) = (v.x as usize, v.y as usize, v.w as usize, v.h as usize);
+            for oy in 0..vh {
+                let src_row = (oy * sh / vh) * sw;
+                let dst_row = (vy + oy) * dw + vx;
+                for ox in 0..vw {
+                    buffer[dst_row + ox] = fb.pixels[src_row + ox * sw / vw] & 0x00ff_ffff;
                 }
             }
         }
@@ -379,11 +420,19 @@ impl App {
 
     fn to_framebuffer(&self, x: f64, y: f64) -> (u16, u16) {
         let size = self.window.as_ref().map(|w| w.inner_size()).unwrap_or_default();
-        let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
-        let (sw, sh) = (fb.width.max(1), fb.height.max(1));
-        let fx = (x.max(0.0) as u32 * sw / size.width.max(1)).min(sw - 1);
-        let fy = (y.max(0.0) as u32 * sh / size.height.max(1)).min(sh - 1);
-        (fx as u16, fy as u16)
+        let (sw, sh) = {
+            let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
+            (fb.width.max(1), fb.height.max(1))
+        };
+        // Map the window point through the scaled, centred view; points in the black margin clamp
+        // to the nearest framebuffer edge, as the Windows client's View::fb_point does.
+        let v = fit_view(sw, sh, size.width, size.height, self.scale_up);
+        if v.w <= 0 || v.h <= 0 {
+            return (0, 0);
+        }
+        let fx = ((x - v.x as f64) * f64::from(sw) / v.w as f64).clamp(0.0, f64::from(sw - 1)) as u16;
+        let fy = ((y - v.y as f64) * f64::from(sh) / v.h as f64).clamp(0.0, f64::from(sh - 1)) as u16;
+        (fx, fy)
     }
 
     fn send_pointer(&mut self) {
@@ -891,6 +940,13 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    // `--no-scale-up` shows a remote screen smaller than the window at 1:1, centred, instead of
+    // enlarging it to fill (the default). Set the module flag before any App is built.
+    if let Some(i) = args.iter().position(|a| a == "--no-scale-up") {
+        args.remove(i);
+        SCALE_UP_FILL.store(false, Ordering::Relaxed);
+    }
+
     // `--tunnel <spec>` routes the RFB path through an SSH forward (TCP).
     let mut tunnel_flag: Option<String> = None;
     if let Some(i) = args.iter().position(|a| a == "--tunnel") {
@@ -1103,5 +1159,32 @@ mod cursor_tests {
     fn rejects_empty_cursor() {
         let empty = CursorShape { hotspot_x: 0, hotspot_y: 0, width: 0, height: 0, pixels: vec![] };
         assert!(scaled_cursor_rgba(&empty, 1.0).is_none());
+    }
+
+    #[test]
+    fn fit_view_downscales_keeping_aspect() {
+        // A Retina framebuffer larger than the window shrinks to fit, centred.
+        let v = fit_view(3456, 2234, 1728, 1117, true);
+        assert_eq!((v.w, v.h), (1728, 1117));
+        assert_eq!((v.x, v.y), (0, 0));
+    }
+
+    #[test]
+    fn fit_view_enlarges_to_fill_when_allowed() {
+        // 1080p native stream maximized on a 4K monitor: fill it exactly 2x.
+        let v = fit_view(1920, 1080, 3840, 2160, true);
+        assert_eq!((v.x, v.y, v.w, v.h), (0, 0, 3840, 2160));
+        // A 16:9 stream in a 16:10 window is letterboxed, never stretched.
+        let v = fit_view(1920, 1080, 1920, 1200, true);
+        assert_eq!((v.w, v.h), (1920, 1080));
+        assert_eq!(v.y, 60);
+    }
+
+    #[test]
+    fn fit_view_without_scale_up_stays_one_to_one() {
+        // A framebuffer smaller than the window is centred at 1:1 when upscaling is off.
+        let v = fit_view(1920, 1080, 3840, 2160, false);
+        assert_eq!((v.w, v.h), (1920, 1080));
+        assert_eq!((v.x, v.y), (960, 540));
     }
 }
