@@ -236,10 +236,10 @@ pub(crate) fn connect(options: &ConnectOptions) -> Result<(ServerInfo, SessionRe
     let mut setup = Vec::with_capacity(64);
     setup.extend_from_slice(&wire::set_pixel_format());
     setup.extend_from_slice(&wire::set_encodings(&options.encodings));
-    // "Auto pasteboard" (client message 0x15) is an Apple Screen Sharing extension. A RealVNC server
-    // (RSA-AES auth) rejects it as an unknown message and drops the connection, so skip it there; Mac
-    // Screen Sharing understands it over both Apple DH and its VNC-auth fallback.
-    if options.sync_clipboard && security != SecurityType::RsaAes {
+    // "Auto pasteboard" (client message 0x15) is an Apple Screen Sharing extension. Any other server
+    // (RealVNC, wayvnc, ...) drops the connection on this unknown message, so send it only when the
+    // caller says it is a Mac; `!= RsaAes` is a safety net for RealVNC, which is never a Mac.
+    if options.sync_clipboard && options.apple_extensions && security != SecurityType::RsaAes {
         setup.extend_from_slice(&wire::set_autopasteboard(1));
     }
     setup.extend_from_slice(&wire::update_request(false, full));

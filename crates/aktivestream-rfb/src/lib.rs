@@ -104,6 +104,10 @@ pub struct ConnectOptions {
     /// to the pasteboard of the user who owns the console; on a headless Mac whose console is
     /// held by `loginwindow` it is a no-op (see docs/mac-screen-sharing.md). Default true.
     pub sync_clipboard: bool,
+    /// Send Apple Screen Sharing-only extensions (currently the auto-pasteboard enable, client
+    /// message 0x15). A generic server (RealVNC, wayvnc, TigerVNC, ...) drops the connection on an
+    /// unknown message, so set this false for anything that is not a Mac. Default true.
+    pub apple_extensions: bool,
     pub connect_timeout: Duration,
 }
 
@@ -114,10 +118,11 @@ impl ConnectOptions {
             port,
             username,
             password: password.into(),
-            security: vec![SecurityType::AppleDh, SecurityType::VncAuth, SecurityType::RsaAes],
+            security: vec![SecurityType::AppleDh, SecurityType::VncAuth, SecurityType::RsaAes, SecurityType::None],
             encodings: Encoding::DEFAULT.to_vec(),
             shared: true,
             sync_clipboard: true,
+            apple_extensions: true,
             connect_timeout: Duration::from_secs(10),
         }
     }
