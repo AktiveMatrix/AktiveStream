@@ -209,6 +209,8 @@ struct App {
     screenshot: Option<std::path::PathBuf>,
     view_only: bool,
     scroll_px: f32,
+    /// Enlarge a framebuffer smaller than the window to fill it (default); off keeps 1:1, centred.
+    scale_up: bool,
 }
 
 thread_local! {
@@ -469,7 +471,7 @@ impl App {
             let fb = self.shared.framebuffer.lock().unwrap();
             (fb.width, fb.height)
         };
-        let view = View::fit(w, h, cw, ch);
+        let view = View::fit_scaled(w, h, cw, ch, self.scale_up);
         if view != self.view {
             let rescaled = view.w != self.view.w;
             self.view = view;
@@ -1208,6 +1210,7 @@ pub fn run_window(
         screenshot: args.screenshot.clone(),
         view_only: args.view_only,
         scroll_px: scroll_px_from_env(),
+        scale_up: !args.no_scale_up,
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(App::update_view);

@@ -16,12 +16,15 @@ pub struct View {
 }
 
 impl View {
-    pub fn fit(fb_w: u32, fb_h: u32, client_w: i32, client_h: i32) -> View {
+    /// Fits the framebuffer to the client area, aspect ratio kept, centred. When `allow_upscale`
+    /// is set, a framebuffer smaller than the window is enlarged to fill it (a 1080p native stream
+    /// in a maximized window); otherwise it is shown at 1:1, centred, as it was before.
+    pub fn fit_scaled(fb_w: u32, fb_h: u32, client_w: i32, client_h: i32, allow_upscale: bool) -> View {
         let (fb_w, fb_h) = (fb_w as i32, fb_h as i32);
         if fb_w <= 0 || fb_h <= 0 || client_w <= 0 || client_h <= 0 {
             return View { fb_w, fb_h, ..View::default() };
         }
-        let (w, h) = if fb_w <= client_w && fb_h <= client_h {
+        let (w, h) = if fb_w <= client_w && fb_h <= client_h && !allow_upscale {
             (fb_w, fb_h)
         } else if i64::from(client_w) * i64::from(fb_h) <= i64::from(client_h) * i64::from(fb_w) {
             (client_w, (i64::from(client_w) * i64::from(fb_h) / i64::from(fb_w)) as i32)
@@ -29,6 +32,11 @@ impl View {
             ((i64::from(client_h) * i64::from(fb_w) / i64::from(fb_h)) as i32, client_h)
         };
         View { fb_w, fb_h, x: (client_w - w) / 2, y: (client_h - h) / 2, w, h }
+    }
+
+    /// Fit without ever enlarging past 1:1. Used for the initial window size.
+    pub fn fit(fb_w: u32, fb_h: u32, client_w: i32, client_h: i32) -> View {
+        Self::fit_scaled(fb_w, fb_h, client_w, client_h, false)
     }
 
     pub fn is_one_to_one(&self) -> bool {
@@ -119,6 +127,20 @@ mod tests {
         let v = View::fit(800, 600, 1920, 1080);
         assert!(v.is_one_to_one());
         assert_eq!((v.x, v.y), (560, 240));
+    }
+
+    #[test]
+    fn upscale_fills_a_larger_window_keeping_aspect() {
+        // 1080p native stream maximized on a 1440p monitor: enlarge to fill, aspect kept, centred.
+        let v = View::fit_scaled(1920, 1080, 2560, 1440, true);
+        assert_eq!((v.w, v.h), (2560, 1440));
+        assert_eq!((v.x, v.y), (0, 0));
+        assert!(!v.is_one_to_one());
+        // A 16:9 stream in a 16:10 window is letterboxed, never stretched.
+        let v = View::fit_scaled(1920, 1080, 1920, 1200, true);
+        assert_eq!(v.w, 1920);
+        assert_eq!(v.h, 1080);
+        assert_eq!(v.y, 60);
     }
 
     #[test]

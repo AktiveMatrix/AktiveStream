@@ -33,7 +33,9 @@ diagnostics:\n\
   --keylog PATH          log every keyboard-hook event, its routing and keysyms, and clipboard traffic\n\
   --native               connect to the Phase 2 native host (QUIC + HEVC) instead of VNC\n\
   --show-cursor          show the local cursor over the view (native hides it by default, as the\n\
-                         remote cursor is already rendered into the video)";
+                         remote cursor is already rendered into the video)\n\
+  --no-scale-up          do not enlarge a remote screen smaller than the window; show it at 1:1,\n\
+                         centred (the default scales it up to fill the window, aspect kept)";
 
 pub struct Args {
     pub host: String,
@@ -51,6 +53,7 @@ pub struct Args {
     pub native: bool,
     pub tunnel: Option<String>,
     pub show_cursor: bool,
+    pub no_scale_up: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,6 +69,7 @@ fn parse_args() -> Result<Args, String> {
     let mut keylog = None;
     let mut native = false;
     let mut show_cursor = false;
+    let mut no_scale_up = false;
     let mut list = false;
     let mut tunnel = None;
     let mut args = std::env::args().skip(1);
@@ -77,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
             "--view-only" => view_only = true,
             "--native" => native = true,
             "--show-cursor" => show_cursor = true,
+            "--no-scale-up" => no_scale_up = true,
             "--list" => list = true,
             "--tunnel" => tunnel = Some(args.next().ok_or("--tunnel needs an ssh destination")?),
             "--keylog" => keylog = Some(args.next().ok_or("--keylog needs a path")?.into()),
@@ -130,6 +135,7 @@ fn parse_args() -> Result<Args, String> {
         native,
         tunnel,
         show_cursor,
+        no_scale_up,
     })
 }
 
