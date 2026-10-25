@@ -195,6 +195,9 @@ pub enum LocalAction {
     ToggleFullscreen,
     ToggleSystemShortcuts,
     Disconnect,
+    /// Show or hide the live stream-statistics readout (Ctrl+Alt+S). Diagnostics only; never
+    /// reaches the host.
+    ToggleStats,
     /// Cycle to the next / previous open session (Right Ctrl + Right / Left). The client switches
     /// which session its window shows and sends input to; the Mac never sees these.
     NextSession,

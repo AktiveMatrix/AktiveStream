@@ -55,6 +55,7 @@ pub(crate) fn mac_default() -> Profile {
             shortcut(CTRL | ALT, F11, LocalAction::ToggleFullscreen),
             shortcut(CTRL | ALT, Left, LocalAction::ToggleSystemShortcuts),
             shortcut(CTRL | ALT, W, LocalAction::Disconnect),
+            shortcut(CTRL | ALT, S, LocalAction::ToggleStats),
         ],
         system_shortcuts: SystemShortcutMode::InFullscreen,
         mouse: MouseRules { ctrl_click_is_right_click: true, ctrl_win_click_is_middle_click: true },
@@ -90,6 +91,7 @@ pub(crate) fn mac_native() -> Profile {
         local_shortcuts: vec![
             shortcut(CTRL | ALT, F11, LocalAction::ToggleFullscreen),
             shortcut(CTRL | ALT, W, LocalAction::Disconnect),
+            shortcut(CTRL | ALT, S, LocalAction::ToggleStats),
         ],
         system_shortcuts: SystemShortcutMode::InFullscreen,
         // Ctrl-click is the Mac's own secondary-click convention.
@@ -126,6 +128,7 @@ pub(crate) fn pc_generic() -> Profile {
         local_shortcuts: vec![
             shortcut(CTRL | ALT, F11, LocalAction::ToggleFullscreen),
             shortcut(CTRL | ALT, W, LocalAction::Disconnect),
+            shortcut(CTRL | ALT, S, LocalAction::ToggleStats),
         ],
         system_shortcuts: SystemShortcutMode::InFullscreen,
         // A PC/Linux target has a real right button; Ctrl+click is just Ctrl+click.

@@ -87,3 +87,23 @@ pub fn text(buf: &mut [u32], dw: usize, x0: usize, y: usize, s: &str, color: u32
 pub fn text_width(s: &str, scale: usize) -> usize {
     s.chars().count() * 8 * scale.max(1)
 }
+
+/// Copies a `sw`x`sh` source buffer of `0x00RRGGBB` pixels into `dst` (a `dw`-wide frame) with its
+/// top-left at (`x`, `y`), clipped to the destination. Used to composite a pre-rendered overlay
+/// panel (the stats readout) onto a client's frame.
+#[allow(clippy::too_many_arguments)]
+pub fn blit(dst: &mut [u32], dw: usize, src: &[u32], sw: usize, sh: usize, x: usize, y: usize) {
+    for row in 0..sh {
+        let dy = y + row;
+        let dst_base = dy * dw + x;
+        let src_base = row * sw;
+        for col in 0..sw {
+            if x + col >= dw {
+                break; // Stay on this row; do not wrap into the next.
+            }
+            if let (Some(px), Some(&s)) = (dst.get_mut(dst_base + col), src.get(src_base + col)) {
+                *px = s;
+            }
+        }
+    }
+}

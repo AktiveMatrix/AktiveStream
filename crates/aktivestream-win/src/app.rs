@@ -58,17 +58,24 @@ use crate::net::{self, Out, Shared};
 use crate::render::Renderer;
 use crate::view::View;
 use crate::{Args, clipboard, cursor, diag};
+use aktivestream_client::stats;
 
 const WM_APP_LOCAL: u32 = WM_APP + 10;
 const TIMER_EXIT: usize = 1;
 /// Debounces window-resize notifications: each WM_SIZE restarts it, so the host gets one
 /// resolution request after the resize settles, not one per intermediate size.
 const TIMER_RESIZE: usize = 2;
+/// Refreshes the live stats readout while it is shown, so its rates keep updating even when the
+/// remote screen is idle and no frame arrives to trigger a repaint.
+const TIMER_HUD: usize = 3;
 const LOCAL_FULLSCREEN: usize = 1;
 const LOCAL_TITLE: usize = 2;
 const LOCAL_DISCONNECT: usize = 3;
 const LOCAL_NEXT_SESSION: usize = 4;
 const LOCAL_PREV_SESSION: usize = 5;
+const LOCAL_STATS: usize = 6;
+/// How often the stats readout refreshes while shown (milliseconds).
+const HUD_REFRESH_MS: u32 = 400;
 
 const BUTTON_LEFT: u8 = 1;
 const BUTTON_MIDDLE: u8 = 2;
@@ -225,6 +232,8 @@ struct App {
     scroll_px: f32,
     /// Enlarge a framebuffer smaller than the window to fill it (default); off keeps 1:1, centred.
     scale_up: bool,
+    /// Live stream-statistics readout (Ctrl+Alt+S), composited over the frame when shown.
+    meter: stats::Meter,
 }
 
 thread_local! {
@@ -307,6 +316,7 @@ fn on_key(ctx: &KeyCtx, hwnd: HWND, kb: &KBDLLHOOKSTRUCT, message: u32) -> bool 
         Some(LocalAction::Disconnect) => Some(LOCAL_DISCONNECT),
         Some(LocalAction::NextSession) => Some(LOCAL_NEXT_SESSION),
         Some(LocalAction::PrevSession) => Some(LOCAL_PREV_SESSION),
+        Some(LocalAction::ToggleStats) => Some(LOCAL_STATS),
         Some(LocalAction::PassChordToWindows) => {
             // Replayed from the hook thread's message loop, after this callback returns.
             let flags = usize::from(extended);
@@ -541,11 +551,38 @@ impl App {
         Some((buf, cw as u32))
     }
 
+    /// A snapshot of the live session counters for the stats readout.
+    fn counters(&self) -> stats::Counters {
+        stats::Counters {
+            bytes: self.shared.bytes_read.load(Ordering::Relaxed),
+            updates: self.shared.updates.load(Ordering::Relaxed),
+            update_pixels: self.shared.update_pixels.load(Ordering::Relaxed),
+            decode: Duration::from_micros(self.shared.decode_micros.load(Ordering::Relaxed)),
+            paints: self.paints,
+            paint: self.paint_time,
+        }
+    }
+
+    /// Feeds the current counters to the stats meter (called after each presented frame and on the
+    /// refresh timer, so the rates keep moving even when the remote screen is idle).
+    fn sample_meter(&mut self) {
+        let c = self.counters();
+        self.meter.sample(Instant::now(), c);
+    }
+
+    /// Bottom-left placement for a readout panel `h` pixels tall within the current client area.
+    fn hud_origin(&self, _w: usize, h: usize) -> (i32, i32) {
+        let (_, ch) = self.client_size();
+        (12, (ch - h as i32 - 12).max(0))
+    }
+
     /// Uploads `area` (None = everything) and draws one frame with Direct3D. Returns false
     /// when there is no usable renderer, so the caller falls back to GDI.
     fn render(&mut self, area: Option<Rect>, capture: bool) -> bool {
         let started = Instant::now();
         let overlay = self.bar_overlay();
+        let hud = self.meter.panel();
+        let hud_pos = hud.as_ref().map(|(_, w, h)| self.hud_origin(*w, *h));
         let Some(renderer) = self.renderer.as_mut() else { return false };
         let uploaded = {
             let fb = self.shared.framebuffer.lock().unwrap();
@@ -559,6 +596,9 @@ impl App {
         renderer.draw(self.view);
         if let Some((buf, w)) = &overlay {
             renderer.draw_bar(buf, *w, bar::BAR_HEIGHT as u32);
+        }
+        if let (Some((buf, w, h)), Some((x, y))) = (&hud, hud_pos) {
+            renderer.draw_overlay(buf, x, y, *w as u32, *h as u32);
         }
         if capture && let Some(path) = &self.screenshot {
             match renderer
@@ -577,6 +617,7 @@ impl App {
         }
         self.paints += 1;
         self.paint_time += started.elapsed();
+        self.sample_meter();
         true
     }
 
@@ -926,9 +967,51 @@ fn paint_gdi(hwnd: HWND, ps: &PAINTSTRUCT, hdc: windows::Win32::Graphics::Gdi::H
             );
         }
     }
+    // Live stats readout (Ctrl+Alt+S), composited bottom-left over the frame.
+    let hud = with_app(|app| {
+        app.meter.panel().map(|(buf, w, h)| {
+            let (x, y) = app.hud_origin(w, h);
+            (buf, w, h, x, y)
+        })
+    })
+    .flatten();
+    if let Some((buf, w, h, x, y)) = hud {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            SetStretchBltMode(hdc, COLORONCOLOR);
+            StretchDIBits(
+                hdc,
+                x,
+                y,
+                w as i32,
+                h as i32,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                Some(buf.as_ptr().cast()),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    }
     with_app(|app| {
+        app.meter.set_renderer("GDI");
         app.paints += 1;
         app.paint_time += started.elapsed();
+        app.sample_meter();
     });
 }
 
@@ -1032,6 +1115,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             with_app(|app| app.request_resolution());
             return LRESULT(0);
         }
+        WM_TIMER if wparam.0 == TIMER_HUD => {
+            // Keep the readout's rates current even when the remote screen is idle (no frame to
+            // trigger a repaint). Sample now, then invalidate so the panel redraws.
+            with_app(|app| app.sample_meter());
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return LRESULT(0);
+        }
         WM_TIMER if wparam.0 == TIMER_EXIT => {
             let captured = with_app(|app| {
                 if app.screenshot.is_none() {
@@ -1068,6 +1160,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                     CLOSED_BY_USER.set(true);
                     unsafe {
                         let _ = DestroyWindow(hwnd);
+                    }
+                }
+                LOCAL_STATS => {
+                    let shown = with_app(|app| {
+                        let shown = app.meter.toggle();
+                        if shown {
+                            app.sample_meter();
+                        }
+                        shown
+                    })
+                    .unwrap_or(false);
+                    unsafe {
+                        if shown {
+                            SetTimer(Some(hwnd), TIMER_HUD, HUD_REFRESH_MS, None);
+                        } else {
+                            let _ = KillTimer(Some(hwnd), TIMER_HUD);
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 _ => {}
@@ -1234,6 +1344,7 @@ pub fn run_window(
             None
         }
     };
+    let renderer_is_d3d = renderer.is_some();
     let app = App {
         hwnd,
         hook_thread,
@@ -1262,6 +1373,7 @@ pub fn run_window(
         view_only: args.view_only,
         scroll_px: scroll_px_from_env(),
         scale_up: !args.no_scale_up,
+        meter: stats::Meter::new(if renderer_is_d3d { "D3D11" } else { "GDI" }),
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(App::update_view);

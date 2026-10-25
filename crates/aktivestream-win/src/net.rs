@@ -35,6 +35,10 @@ pub struct Shared {
     pub error: Mutex<Option<String>>,
     pub updates: AtomicU64,
     pub update_pixels: AtomicU64,
+    /// Cumulative bytes read from the server (RFB path only; 0 on the native video path).
+    pub bytes_read: AtomicU64,
+    /// Cumulative decode time in microseconds (RFB path only).
+    pub decode_micros: AtomicU64,
     hwnd: AtomicIsize,
 }
 
@@ -49,6 +53,8 @@ impl Shared {
             error: Mutex::new(None),
             updates: AtomicU64::new(0),
             update_pixels: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            decode_micros: AtomicU64::new(0),
             hwnd: AtomicIsize::new(0),
         }
     }
@@ -139,6 +145,9 @@ pub fn spawn_reader(shared: Arc<Shared>, mut reader: SessionReader) {
                         let pixels: u64 = dirty.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum();
                         shared.updates.fetch_add(1, Ordering::Relaxed);
                         shared.update_pixels.fetch_add(pixels, Ordering::Relaxed);
+                        let st = reader.stats();
+                        shared.bytes_read.store(st.bytes_read, Ordering::Relaxed);
+                        shared.decode_micros.store(st.decode_time.as_micros() as u64, Ordering::Relaxed);
                         let mut slot = shared.dirty.lock().unwrap();
                         let merged = dirty.into_iter().fold(*slot, |acc, r| Some(acc.map_or(r, |a| union(a, r))));
                         *slot = merged;

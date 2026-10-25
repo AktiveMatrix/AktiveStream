@@ -6,4 +6,5 @@ pub mod bar;
 pub mod config;
 pub mod draw;
 pub mod manager;
+pub mod stats;
 pub mod tunnel;

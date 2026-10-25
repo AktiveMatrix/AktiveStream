@@ -14,7 +14,7 @@ mod native;
 mod secret;
 
 use aktivestream_client::manager::{self, Manager, Outcome};
-use aktivestream_client::{bar, config, tunnel};
+use aktivestream_client::{bar, config, draw, stats, tunnel};
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -22,7 +22,7 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aktivestream_keymap::native::NativeInput;
 use aktivestream_keymap::{Engine, HostEvent, KeyInput, LocalAction, MouseButton, Profile, RfbTranslator};
@@ -32,12 +32,12 @@ use softbuffer::{Context, Surface};
 use tokio::sync::mpsc::UnboundedSender;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseButton as WinitButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
+use winit::event::{ElementState, KeyEvent, MouseButton as WinitButton, MouseScrollDelta, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Whether a remote screen smaller than the window is enlarged to fill it (default), aspect kept,
 /// or shown at 1:1, centred (`--no-scale-up`). Set once in `main`, read when an `App` is built.
@@ -113,6 +113,11 @@ struct Shared {
     last_clip: Mutex<Option<String>>,
     /// A newly-received remote cursor shape, picked up and applied by the UI thread.
     cursor: Mutex<Option<CursorShape>>,
+    /// Live session counters for the stats readout, written by the reader thread.
+    updates: AtomicU64,
+    update_pixels: AtomicU64,
+    bytes: AtomicU64,
+    decode_micros: AtomicU64,
 }
 
 impl Shared {
@@ -122,6 +127,22 @@ impl Shared {
             error: Mutex::new(None),
             last_clip: Mutex::new(None),
             cursor: Mutex::new(None),
+            updates: AtomicU64::new(0),
+            update_pixels: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            decode_micros: AtomicU64::new(0),
+        }
+    }
+
+    /// A snapshot of the counters for the stats meter.
+    fn counters(&self, paints: u64, paint: Duration) -> stats::Counters {
+        stats::Counters {
+            bytes: self.bytes.load(Ordering::Relaxed),
+            updates: self.updates.load(Ordering::Relaxed),
+            update_pixels: self.update_pixels.load(Ordering::Relaxed),
+            decode: Duration::from_micros(self.decode_micros.load(Ordering::Relaxed)),
+            paints,
+            paint,
         }
     }
 }
@@ -134,7 +155,16 @@ fn run_reader(shared: Arc<Shared>, proxy: EventLoopProxy<()>, mut reader: Sessio
     let mut clipboard = if clipboard_enabled { arboard::Clipboard::new().ok() } else { None };
     loop {
         match reader.next_event(&shared.framebuffer) {
-            Ok(ServerEvent::Update { .. } | ServerEvent::Resized { .. }) => {
+            Ok(ServerEvent::Update { dirty }) => {
+                let pixels: u64 = dirty.iter().map(|r| u64::from(r.w) * u64::from(r.h)).sum();
+                shared.updates.fetch_add(1, Ordering::Relaxed);
+                shared.update_pixels.fetch_add(pixels, Ordering::Relaxed);
+                let st = reader.stats();
+                shared.bytes.store(st.bytes_read, Ordering::Relaxed);
+                shared.decode_micros.store(st.decode_time.as_micros() as u64, Ordering::Relaxed);
+                let _ = proxy.send_event(());
+            }
+            Ok(ServerEvent::Resized { .. }) => {
                 let _ = proxy.send_event(());
             }
             Ok(ServerEvent::CutText(text)) => apply_remote_clipboard(&shared, clipboard.as_mut(), text),
@@ -241,6 +271,10 @@ struct App {
     system_keys: SystemKeys,
     window: Option<Rc<Window>>,
     surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    /// Live stream-statistics readout (Ctrl+Alt+S) and the client-side present counters feeding it.
+    meter: stats::Meter,
+    paints: u64,
+    paint_time: Duration,
 }
 
 /// Where input goes and how it is encoded: RFB keysyms/pointer, or native `Input` messages over
@@ -304,6 +338,9 @@ impl App {
             system_keys: Arc::new(Mutex::new(VecDeque::new())),
             window: None,
             surface: None,
+            meter: stats::Meter::new("softbuffer"),
+            paints: 0,
+            paint_time: Duration::ZERO,
         }
     }
 
@@ -352,6 +389,7 @@ impl App {
     /// Nearest-neighbour blit of the remote framebuffer, scaled to the window. Pixels are already
     /// `0x00RRGGBB`, so no colour conversion is needed.
     fn redraw(&mut self) {
+        let frame_start = Instant::now();
         let (Some(window), Some(surface)) = (self.window.clone(), self.surface.as_mut()) else {
             return;
         };
@@ -385,7 +423,19 @@ impl App {
             let title = &self.sessions[self.active].title;
             bar::draw_bar(&mut buffer, dw, dh, bar::bar_action_at(self.cursor, dw), title);
         }
+        // Live stats readout (Ctrl+Alt+S), composited bottom-left.
+        if let Some((panel, pw, ph)) = self.meter.panel() {
+            let x = 12;
+            let y = dh.saturating_sub(ph + 12);
+            draw::blit(&mut buffer, dw, &panel, pw, ph, x, y);
+        }
         let _ = buffer.present();
+        self.paints += 1;
+        self.paint_time += frame_start.elapsed();
+        if self.meter.visible() {
+            let c = self.sessions[self.active].shared.counters(self.paints, self.paint_time);
+            self.meter.sample(Instant::now(), c);
+        }
     }
 
     fn send_host_events(&mut self, events: Vec<HostEvent>) {
@@ -426,6 +476,13 @@ impl App {
             Some(LocalAction::Disconnect) => event_loop.exit(),
             Some(LocalAction::NextSession) => self.switch(1, event_loop),
             Some(LocalAction::PrevSession) => self.switch(-1, event_loop),
+            Some(LocalAction::ToggleStats) => {
+                if self.meter.toggle() {
+                    let c = self.sessions[self.active].shared.counters(self.paints, self.paint_time);
+                    self.meter.sample(Instant::now(), c);
+                }
+                self.request_redraw();
+            }
             _ => {}
         }
         self.send_host_events(output.host);
@@ -629,6 +686,22 @@ impl ApplicationHandler<()> for App {
         }
         self.window = Some(window.clone());
         window.request_redraw();
+    }
+
+    /// While the stats readout is shown, wake on a timer so its rates keep updating even when the
+    /// remote screen is idle (no frame arrives to trigger a redraw). Otherwise wait for events.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.meter.visible() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(400)));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
+        if matches!(cause, StartCause::ResumeTimeReached { .. }) && self.meter.visible() {
+            self.request_redraw();
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, _: ()) {
@@ -936,6 +1009,70 @@ fn bar_preview(path: &str) -> Result<(), String> {
     writer.write_image_data(&rgb).map_err(|e| e.to_string())
 }
 
+/// Renders the live stats readout over a gradient (stand-in for the video) to PNGs, so the panel
+/// can be checked without a live session: a server/link-bound sample to `<path>`, a decode-bound
+/// one to `<path>-decode.png`, and an idle one to `<path>-idle.png`. Pure-local; no connection.
+fn stats_preview(path: &str) -> Result<(), String> {
+    let (w, h) = (640usize, 400usize);
+    let write = |rates: &stats::Rates, renderer: &str, out: &str| -> Result<(), String> {
+        let mut buf = vec![0u32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                buf[y * w + x] = (((x * 120 / w) as u32) << 16) | (((y * 120 / h) as u32) << 8) | 0x40;
+            }
+        }
+        let (panel, pw, ph) = stats::render_panel(rates, renderer);
+        draw::blit(&mut buf, w, &panel, pw, ph, 12, h.saturating_sub(ph + 12));
+        let file = std::fs::File::create(out).map_err(|e| e.to_string())?;
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for p in &buf {
+            rgb.push((p >> 16) as u8);
+            rgb.push((p >> 8) as u8);
+            rgb.push(*p as u8);
+        }
+        writer.write_image_data(&rgb).map_err(|e| e.to_string())
+    };
+    // Mac-like: client keeps up, ~11 Mpix/s, waiting on the server's encoder.
+    let server = stats::Rates {
+        span: 1.0,
+        fps: 58.0,
+        updates_per_s: 11.0,
+        mbps: 4.3,
+        mpix_per_s: 11.0,
+        decode_ms: 6.0,
+        paint_ms: 1.5,
+        bytes_per_mpix: 390_000.0,
+        decode_load: 0.07,
+        paint_load: 0.09,
+        bytes_known: true,
+    };
+    write(&server, "D3D11", path)?;
+    // Decode-saturated reader (a weak client or a huge lossless frame stream).
+    let decode = stats::Rates {
+        span: 1.0,
+        fps: 24.0,
+        updates_per_s: 24.0,
+        mbps: 40.0,
+        mpix_per_s: 50.0,
+        decode_ms: 38.0,
+        paint_ms: 4.0,
+        bytes_per_mpix: 800_000.0,
+        decode_load: 0.91,
+        paint_load: 0.1,
+        bytes_known: true,
+    };
+    let decode_path = path.strip_suffix(".png").map_or_else(|| format!("{path}-decode"), |b| format!("{b}-decode.png"));
+    write(&decode, "softbuffer", &decode_path)?;
+    // Idle: nothing changing.
+    let idle = stats::Rates { span: 1.0, bytes_known: true, ..Default::default() };
+    let idle_path = path.strip_suffix(".png").map_or_else(|| format!("{path}-idle"), |b| format!("{b}-idle.png"));
+    write(&idle, "softbuffer", &idle_path)
+}
+
 /// Headless render of the connection manager to PNGs (AKTIVE_PICKER_PREVIEW), for verifying its
 /// layout without a display: the list view to `<path>` and the edit form to `<path>-form.png`.
 /// Uses the saved phone book, or a sample list when it is empty.
@@ -993,6 +1130,9 @@ fn main() -> Result<(), String> {
     }
     if let Ok(path) = std::env::var("AKTIVE_PICKER_PREVIEW") {
         return picker_preview(&path);
+    }
+    if let Ok(path) = std::env::var("AKTIVE_STATS_PREVIEW") {
+        return stats_preview(&path);
     }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
