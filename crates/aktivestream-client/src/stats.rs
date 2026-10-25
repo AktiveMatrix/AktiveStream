@@ -20,7 +20,7 @@ const WINDOW: Duration = Duration::from_millis(1200);
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counters {
     /// Bytes received from the server since the handshake. 0 means "unknown" (the native video
-    /// path has no RFB byte count), which the readout shows as `—`.
+    /// path has no RFB byte count), which the readout shows as `n/a` (font8x8 is ASCII-only).
     pub bytes: u64,
     /// FramebufferUpdates applied.
     pub updates: u64,
@@ -114,7 +114,7 @@ impl Rates {
 
     /// The readout lines, top to bottom (verdict excluded; it is drawn in its own colour).
     fn lines(&self, renderer: &str) -> Vec<String> {
-        let wire = if self.bytes_known { format!("{:.1} MB/s", self.mbps) } else { "—".to_string() };
+        let wire = if self.bytes_known { format!("{:.1} MB/s", self.mbps) } else { "n/a".to_string() };
         let eff = if self.bytes_known && self.mpix_per_s > 0.0 {
             format!("  {:.2} B/px", self.bytes_per_mpix / 1e6)
         } else {
