@@ -3,6 +3,7 @@
 //! not tied to a platform live here so all clients stay in parity instead of drifting.
 
 pub mod bar;
+pub mod capture;
 pub mod config;
 pub mod draw;
 pub mod manager;

@@ -58,6 +58,8 @@ use crate::net::{self, Out, Shared};
 use crate::render::Renderer;
 use crate::view::View;
 use crate::{Args, clipboard, cursor, diag};
+use aktivestream_client::capture;
+use aktivestream_client::draw;
 use aktivestream_client::stats;
 
 const WM_APP_LOCAL: u32 = WM_APP + 10;
@@ -68,12 +70,17 @@ const TIMER_RESIZE: usize = 2;
 /// Refreshes the live stats readout while it is shown, so its rates keep updating even when the
 /// remote screen is idle and no frame arrives to trigger a repaint.
 const TIMER_HUD: usize = 3;
+/// Clears the transient capture-confirmation toast after it has been shown briefly.
+const TIMER_TOAST: usize = 4;
+/// How long the capture confirmation toast stays on screen (milliseconds).
+const TOAST_MS: u32 = 2200;
 const LOCAL_FULLSCREEN: usize = 1;
 const LOCAL_TITLE: usize = 2;
 const LOCAL_DISCONNECT: usize = 3;
 const LOCAL_NEXT_SESSION: usize = 4;
 const LOCAL_PREV_SESSION: usize = 5;
 const LOCAL_STATS: usize = 6;
+const LOCAL_CAPTURE: usize = 7;
 /// How often the stats readout refreshes while shown (milliseconds).
 const HUD_REFRESH_MS: u32 = 400;
 
@@ -234,6 +241,8 @@ struct App {
     scale_up: bool,
     /// Live stream-statistics readout (Ctrl+Alt+S), composited over the frame when shown.
     meter: stats::Meter,
+    /// Transient capture-confirmation message and when it was shown; cleared by `TIMER_TOAST`.
+    toast: Option<(String, Instant)>,
 }
 
 thread_local! {
@@ -317,6 +326,7 @@ fn on_key(ctx: &KeyCtx, hwnd: HWND, kb: &KBDLLHOOKSTRUCT, message: u32) -> bool 
         Some(LocalAction::NextSession) => Some(LOCAL_NEXT_SESSION),
         Some(LocalAction::PrevSession) => Some(LOCAL_PREV_SESSION),
         Some(LocalAction::ToggleStats) => Some(LOCAL_STATS),
+        Some(LocalAction::Capture) => Some(LOCAL_CAPTURE),
         Some(LocalAction::PassChordToWindows) => {
             // Replayed from the hook thread's message loop, after this callback returns.
             let flags = usize::from(extended);
@@ -511,7 +521,9 @@ impl App {
             let fb = self.shared.framebuffer.lock().unwrap();
             (fb.width, fb.height)
         };
-        let view = View::fit_scaled(w, h, cw, ch, self.scale_up);
+        let top = self.top_inset();
+        let mut view = View::fit_scaled(w, h, cw, (ch - top).max(1), self.scale_up);
+        view.y += top; // leave room for the persistent toolbar strip
         if view != self.view {
             let rescaled = view.w != self.view.w;
             self.view = view;
@@ -519,6 +531,12 @@ impl App {
                 self.rebuild_cursor();
             }
         }
+    }
+
+    /// Pixels reserved at the top of the client area for the persistent toolbar. In full screen the
+    /// toolbar floats over the remote view and reveals on hover, so nothing is reserved there.
+    fn top_inset(&self) -> i32 {
+        if self.fullscreen || self.bar_force { 0 } else { bar::BAR_HEIGHT as i32 }
     }
 
     fn rebuild_cursor(&mut self) {
@@ -530,12 +548,13 @@ impl App {
         self.cursor.as_ref().map(|c| c.0)
     }
 
-    /// Whether the overlay toolbar should be shown: full screen, with the pointer at the top edge.
+    /// Whether the toolbar should be shown now: always in windowed mode (a persistent strip above
+    /// the remote view); in full screen only while the pointer is at the top edge.
     fn bar_visible(&self) -> bool {
-        (self.fullscreen || self.bar_force)
-            && self.cursor_px.0 >= 0
-            && self.cursor_px.1 >= 0
-            && (self.cursor_px.1 as usize) < bar::BAR_HEIGHT
+        if !self.fullscreen && !self.bar_force {
+            return true;
+        }
+        self.cursor_px.0 >= 0 && self.cursor_px.1 >= 0 && (self.cursor_px.1 as usize) < bar::BAR_HEIGHT
     }
 
     /// Builds the overlay toolbar for the current window width (full width, `BAR_HEIGHT` tall,
@@ -547,8 +566,27 @@ impl App {
         let cw = self.client_size().0.max(1) as usize;
         let mut buf = vec![0u32; cw * bar::BAR_HEIGHT];
         let hover = bar::bar_action_at((self.cursor_px.0 as f64, self.cursor_px.1 as f64), cw);
-        bar::draw_bar(&mut buf, cw, bar::BAR_HEIGHT, hover, &self.name);
+        bar::draw_bar(&mut buf, cw, bar::BAR_HEIGHT, hover, &self.name, self.fullscreen);
         Some((buf, cw as u32))
+    }
+
+    /// The transient capture-confirmation toast, sized and positioned bottom-centre, or `None` when
+    /// none is active or it has expired. `(pixels, w, h, x, y)` for the client to composite.
+    fn toast_overlay(&self) -> Option<(Vec<u32>, usize, usize, i32, i32)> {
+        let (msg, shown) = self.toast.as_ref()?;
+        if shown.elapsed() >= Duration::from_millis(TOAST_MS as u64) {
+            return None;
+        }
+        let (buf, w, h) = draw::label_panel(msg, 2);
+        let (cw, ch) = self.client_size();
+        let x = ((cw - w as i32) / 2).max(0);
+        let y = (ch - h as i32 - 28).max(0);
+        Some((buf, w, h, x, y))
+    }
+
+    /// Shows a confirmation toast and arms the timer that clears it.
+    fn show_toast(&mut self, msg: String) {
+        self.toast = Some((msg, Instant::now()));
     }
 
     /// A snapshot of the live session counters for the stats readout.
@@ -583,6 +621,7 @@ impl App {
         let overlay = self.bar_overlay();
         let hud = self.meter.panel();
         let hud_pos = hud.as_ref().map(|(_, w, h)| self.hud_origin(*w, *h));
+        let toast = self.toast_overlay();
         let Some(renderer) = self.renderer.as_mut() else { return false };
         let uploaded = {
             let fb = self.shared.framebuffer.lock().unwrap();
@@ -599,6 +638,9 @@ impl App {
         }
         if let (Some((buf, w, h)), Some((x, y))) = (&hud, hud_pos) {
             renderer.draw_overlay(buf, x, y, *w as u32, *h as u32);
+        }
+        if let Some((buf, w, h, x, y)) = &toast {
+            renderer.draw_overlay(buf, *x, *y, *w as u32, *h as u32);
         }
         if capture && let Some(path) = &self.screenshot {
             match renderer
@@ -661,34 +703,32 @@ impl App {
             }
         }
         self.cursor_px = (point.x, point.y);
-        if self.fullscreen {
-            let over = point.x >= 0 && point.y >= 0 && (point.y as usize) < bar::BAR_HEIGHT;
-            if over || self.bar_shown {
-                // Repaint the top strip so the toolbar reveals, updates its hover, or clears.
-                let strip =
-                    RECT { left: 0, top: 0, right: self.client_size().0.max(1), bottom: bar::BAR_HEIGHT as i32 };
-                unsafe {
-                    let _ = InvalidateRect(Some(self.hwnd), Some(&strip), false);
-                }
+        let cw = self.client_size().0.max(1);
+        let over_bar = self.bar_visible() && point.x >= 0 && point.y >= 0 && (point.y as usize) < bar::BAR_HEIGHT;
+        if over_bar || self.bar_shown {
+            // Entering, leaving or moving within the strip: repaint it to reveal, hover, or clear.
+            let strip = RECT { left: 0, top: 0, right: cw, bottom: bar::BAR_HEIGHT as i32 };
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&strip), false);
             }
-            self.bar_shown = over;
-            if over {
-                if message == WM_LBUTTONDOWN {
-                    let cw = self.client_size().0.max(1) as usize;
-                    let code = match bar::bar_action_at((point.x as f64, point.y as f64), cw) {
-                        Some(bar::BarAction::Windowed) => Some(LOCAL_FULLSCREEN),
-                        Some(bar::BarAction::Disconnect) => Some(LOCAL_DISCONNECT),
-                        None => None,
-                    };
-                    if let Some(code) = code {
-                        unsafe {
-                            let _ = PostMessageW(Some(self.hwnd), WM_APP_LOCAL, WPARAM(code), LPARAM(0));
-                        }
+        }
+        self.bar_shown = over_bar;
+        if over_bar {
+            if message == WM_LBUTTONDOWN {
+                let code = match bar::bar_action_at((point.x as f64, point.y as f64), cw as usize) {
+                    Some(bar::BarAction::Capture) => Some(LOCAL_CAPTURE),
+                    Some(bar::BarAction::Fullscreen) => Some(LOCAL_FULLSCREEN),
+                    Some(bar::BarAction::Disconnect) => Some(LOCAL_DISCONNECT),
+                    None => None,
+                };
+                if let Some(code) = code {
+                    unsafe {
+                        let _ = PostMessageW(Some(self.hwnd), WM_APP_LOCAL, WPARAM(code), LPARAM(0));
                     }
                 }
-                // Swallow all pointer input over the toolbar so it never reaches the Mac.
-                return;
             }
+            // Swallow all pointer input over the toolbar so it never reaches the Mac.
+            return;
         }
         let (x, y) = self.view.fb_point(point.x, point.y);
         self.last_pointer = (x, y);
@@ -792,8 +832,10 @@ fn size_window(hwnd: HWND, fb_w: u32, fb_h: u32) {
     }
     let (frame_w, frame_h) = (frame.right - frame.left, frame.bottom - frame.top);
     let (work_w, work_h) = (work.right - work.left, work.bottom - work.top);
-    let view = View::fit(fb_w, fb_h, work_w - frame_w, work_h - frame_h);
-    let (w, h) = (view.w + frame_w, view.h + frame_h);
+    // Reserve the persistent toolbar strip so the framebuffer still fits 1:1 below it.
+    let bar_h = bar::BAR_HEIGHT as i32;
+    let view = View::fit(fb_w, fb_h, work_w - frame_w, work_h - frame_h - bar_h);
+    let (w, h) = (view.w + frame_w, view.h + frame_h + bar_h);
     unsafe {
         let _ = SetWindowPos(
             hwnd,
@@ -875,6 +917,49 @@ fn toggle_fullscreen(hwnd: HWND) {
         }
     }
     update_title(hwnd);
+}
+
+/// Captures the remote screen — the native-resolution framebuffer, not the scaled window — to a PNG
+/// under Pictures/AktiveStream and to the clipboard, then shows a brief confirmation toast.
+fn capture_screenshot(hwnd: HWND) {
+    let Some((name, w, h, pixels)) = with_app(|app| {
+        let fb = app.shared.framebuffer.lock().unwrap();
+        (app.name.clone(), fb.width as usize, fb.height as usize, fb.pixels.clone())
+    }) else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let path = capture::default_path(&name);
+    let file_ok = match capture::encode_png(&pixels, w, h) {
+        Ok(bytes) => {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            std::fs::write(&path, &bytes).is_ok()
+        }
+        Err(e) => {
+            eprintln!("screenshot encode failed: {e}");
+            false
+        }
+    };
+    let clip_ok = clipboard::write_image(hwnd, w as u32, h as u32, &capture::to_rgba(&pixels, w, h));
+    if file_ok {
+        println!("screenshot: {}", path.display());
+    }
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("screenshot.png");
+    let msg = match (file_ok, clip_ok) {
+        (true, true) => format!("Saved {fname}  +  clipboard"),
+        (true, false) => format!("Saved {fname}"),
+        (false, true) => "Copied to clipboard".to_string(),
+        (false, false) => "Screenshot failed".to_string(),
+    };
+    with_app(|app| app.show_toast(msg));
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_TOAST, TOAST_MS, None);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
 }
 
 /// GDI fallback for when Direct3D is unavailable.
@@ -976,6 +1061,39 @@ fn paint_gdi(hwnd: HWND, ps: &PAINTSTRUCT, hdc: windows::Win32::Graphics::Gdi::H
     })
     .flatten();
     if let Some((buf, w, h, x, y)) = hud {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        unsafe {
+            SetStretchBltMode(hdc, COLORONCOLOR);
+            StretchDIBits(
+                hdc,
+                x,
+                y,
+                w as i32,
+                h as i32,
+                0,
+                0,
+                w as i32,
+                h as i32,
+                Some(buf.as_ptr().cast()),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+    }
+    // Capture-confirmation toast, composited bottom-centre.
+    if let Some((buf, w, h, x, y)) = with_app(|app| app.toast_overlay()).flatten() {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -1124,6 +1242,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
             }
             return LRESULT(0);
         }
+        WM_TIMER if wparam.0 == TIMER_TOAST => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), TIMER_TOAST);
+            }
+            with_app(|app| app.toast = None);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            return LRESULT(0);
+        }
         WM_TIMER if wparam.0 == TIMER_EXIT => {
             let captured = with_app(|app| {
                 if app.screenshot.is_none() {
@@ -1180,6 +1308,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
+                LOCAL_CAPTURE => capture_screenshot(hwnd),
                 _ => {}
             }
             return LRESULT(0);
@@ -1374,6 +1503,7 @@ pub fn run_window(
         scroll_px: scroll_px_from_env(),
         scale_up: !args.no_scale_up,
         meter: stats::Meter::new(if renderer_is_d3d { "D3D11" } else { "GDI" }),
+        toast: None,
     };
     APP.with(|cell| *cell.borrow_mut() = Some(app));
     with_app(App::update_view);

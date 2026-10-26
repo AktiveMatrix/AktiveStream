@@ -198,6 +198,10 @@ pub enum LocalAction {
     /// Show or hide the live stream-statistics readout (Ctrl+Alt+S). Diagnostics only; never
     /// reaches the host.
     ToggleStats,
+    /// Save a screenshot of the remote screen (Ctrl+Alt+C): the native-resolution framebuffer to a
+    /// PNG under Pictures/AktiveStream and to the clipboard. Handled client-side; never reaches the
+    /// host.
+    Capture,
     /// Cycle to the next / previous open session (Right Ctrl + Right / Left). The client switches
     /// which session its window shows and sends input to; the Mac never sees these.
     NextSession,

@@ -9,3 +9,6 @@ publish.workspace = true
 [dependencies]
 # Public-domain 8x8 bitmap font for the overlay toolbar text (connection name); pure data.
 font8x8 = "0.3"
+# Encode the remote framebuffer to PNG for the screen-capture button (shared so every client
+# writes identical files). Same version the other crates pin.
+png = "0.17"

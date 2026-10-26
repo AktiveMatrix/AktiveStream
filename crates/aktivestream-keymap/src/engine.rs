@@ -816,11 +816,11 @@ mod tests {
         let mut e = engine();
         down(&mut e, Key::LCtrl);
         down(&mut e, Key::LAlt);
-        down(&mut e, Key::C);
-        assert_eq!(e.release_all(), vec![ku(Key::C), mu(Option), mu(Command)]);
+        down(&mut e, Key::B);
+        assert_eq!(e.release_all(), vec![ku(Key::B), mu(Option), mu(Command)]);
         assert!(e.release_all().is_empty());
         // Releases of keys pressed before are now unknown and go to Windows.
-        let out = up(&mut e, Key::C);
+        let out = up(&mut e, Key::B);
         assert_eq!(out.disposition, PassToOs);
         host(out, &[]);
         host(up(&mut e, Key::LCtrl), &[]);

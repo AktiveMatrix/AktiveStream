@@ -107,3 +107,17 @@ pub fn blit(dst: &mut [u32], dw: usize, src: &[u32], sw: usize, sh: usize, x: us
         }
     }
 }
+
+/// Builds a tight dark panel (bg `0x12121a`, border `0x333340`) holding one left-aligned line of
+/// text at `scale`, sized to its content. Returns `(pixels, width, height)` for the client to
+/// composite — used for the transient capture confirmation toast, matching the stats readout's look.
+pub fn label_panel(s: &str, scale: usize) -> (Vec<u32>, usize, usize) {
+    const PAD: usize = 10;
+    let w = text_width(s, scale) + 2 * PAD;
+    let h = 2 * PAD + 8 * scale.max(1);
+    let mut buf = vec![0u32; w * h];
+    fill_rect(&mut buf, w, 0, 0, w, h, 0x12_12_1a);
+    rect_outline(&mut buf, w, 0, 0, w, h, 0x33_33_40);
+    text(&mut buf, w, PAD, PAD, s, 0xdd_dd_dd, w.saturating_sub(PAD), scale);
+    (buf, w, h)
+}

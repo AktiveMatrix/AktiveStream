@@ -14,7 +14,7 @@ mod native;
 mod secret;
 
 use aktivestream_client::manager::{self, Manager, Outcome};
-use aktivestream_client::{bar, config, draw, stats, tunnel};
+use aktivestream_client::{bar, capture, config, draw, stats, tunnel};
 
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -47,6 +47,9 @@ static SCALE_UP_FILL: AtomicBool = AtomicBool::new(true);
 /// rather than a Mac. Set once in `main`, read where the profile, translator and connect options
 /// are built.
 static GENERIC: AtomicBool = AtomicBool::new(false);
+
+/// How long the capture-confirmation toast stays on screen (milliseconds).
+const TOAST_MS: u64 = 2200;
 
 /// Where the remote framebuffer sits in the window: scaled to fit with the aspect ratio kept and
 /// centred, enlarging past 1:1 to fill the window only when `scale_up` is set. The same geometry
@@ -275,6 +278,8 @@ struct App {
     meter: stats::Meter,
     paints: u64,
     paint_time: Duration,
+    /// Transient capture-confirmation message and when it was shown; cleared after `TOAST_MS`.
+    toast: Option<(String, Instant)>,
 }
 
 /// Where input goes and how it is encoded: RFB keysyms/pointer, or native `Input` messages over
@@ -341,6 +346,7 @@ impl App {
             meter: stats::Meter::new("softbuffer"),
             paints: 0,
             paint_time: Duration::ZERO,
+            toast: None,
         }
     }
 
@@ -376,7 +382,7 @@ impl App {
             let fb = self.sessions[self.active].shared.framebuffer.lock().unwrap();
             (fb.width, fb.height)
         };
-        let v = fit_view(sw, sh, size.width, size.height, self.scale_up);
+        let v = self.view_rect(size.width, size.height, sw, sh);
         let scale = if sw > 0 && v.w > 0 { v.w as f64 / f64::from(sw) } else { 1.0 };
         let Some((rgba, w, h, hx, hy)) = scaled_cursor_rgba(shape, scale) else {
             return;
@@ -384,6 +390,59 @@ impl App {
         if let Ok(source) = winit::window::CustomCursor::from_rgba(rgba, w, h, hx, hy) {
             window.set_cursor(event_loop.create_custom_cursor(source));
         }
+    }
+
+    /// Pixels reserved at the top for the persistent toolbar (windowed only; in full screen it
+    /// floats over the remote view and reveals on hover).
+    fn top_inset(&self) -> u32 {
+        if self.fullscreen { 0 } else { bar::BAR_HEIGHT as u32 }
+    }
+
+    /// The remote view's placement in the window, with room left for the persistent toolbar.
+    fn view_rect(&self, win_w: u32, win_h: u32, fb_w: u32, fb_h: u32) -> ViewRect {
+        let inset = self.top_inset();
+        let mut v = fit_view(fb_w, fb_h, win_w, win_h.saturating_sub(inset).max(1), self.scale_up);
+        v.y += i64::from(inset);
+        v
+    }
+
+    /// Captures the remote screen (native-resolution framebuffer) to a PNG under Pictures/
+    /// AktiveStream and to the clipboard, then shows a brief confirmation toast.
+    fn capture_screenshot(&mut self) {
+        let (name, w, h, pixels) = {
+            let session = &self.sessions[self.active];
+            let fb = session.shared.framebuffer.lock().unwrap();
+            (session.title.clone(), fb.width as usize, fb.height as usize, fb.pixels.clone())
+        };
+        if w == 0 || h == 0 {
+            return;
+        }
+        let path = capture::default_path(&name);
+        let file_ok = match capture::encode_png(&pixels, w, h) {
+            Ok(bytes) => {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                std::fs::write(&path, &bytes).is_ok()
+            }
+            Err(e) => {
+                eprintln!("screenshot encode failed: {e}");
+                false
+            }
+        };
+        let clip_ok = copy_image_to_clipboard(w, h, &capture::to_rgba(&pixels, w, h));
+        if file_ok {
+            println!("screenshot: {}", path.display());
+        }
+        let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("screenshot.png");
+        let msg = match (file_ok, clip_ok) {
+            (true, true) => format!("Saved {fname}  +  clipboard"),
+            (true, false) => format!("Saved {fname}"),
+            (false, true) => "Copied to clipboard".to_string(),
+            (false, false) => "Screenshot failed".to_string(),
+        };
+        self.toast = Some((msg, Instant::now()));
+        self.request_redraw();
     }
 
     /// Nearest-neighbour blit of the remote framebuffer, scaled to the window. Pixels are already
@@ -408,7 +467,12 @@ impl App {
         // Scale to fit the window with the aspect ratio kept, centred; the margin stays black.
         buffer.fill(0);
         if sw != 0 && sh != 0 {
-            let v = fit_view(sw as u32, sh as u32, dw as u32, dh as u32, self.scale_up);
+            // Inlined view (disjoint field reads only) so the `surface` borrow does not clash with a
+            // whole-`&self` method call; mirrors `view_rect`.
+            let inset = if self.fullscreen { 0 } else { bar::BAR_HEIGHT as u32 };
+            let mut v =
+                fit_view(sw as u32, sh as u32, dw as u32, (dh as u32).saturating_sub(inset).max(1), self.scale_up);
+            v.y += i64::from(inset);
             let (vx, vy, vw, vh) = (v.x as usize, v.y as usize, v.w as usize, v.h as usize);
             for oy in 0..vh {
                 let src_row = (oy * sh / vh) * sw;
@@ -419,14 +483,23 @@ impl App {
             }
         }
         drop(fb);
-        if self.fullscreen && self.bar_shown {
+        if !self.fullscreen || self.bar_shown {
+            let hover = bar::bar_action_at(self.cursor, dw);
             let title = &self.sessions[self.active].title;
-            bar::draw_bar(&mut buffer, dw, dh, bar::bar_action_at(self.cursor, dw), title);
+            bar::draw_bar(&mut buffer, dw, dh, hover, title, self.fullscreen);
         }
         // Live stats readout (Ctrl+Alt+S), composited bottom-left.
         if let Some((panel, pw, ph)) = self.meter.panel() {
             let x = 12;
             let y = dh.saturating_sub(ph + 12);
+            draw::blit(&mut buffer, dw, &panel, pw, ph, x, y);
+        }
+        // Capture-confirmation toast, composited bottom-centre.
+        if let Some((msg, shown)) = &self.toast
+            && shown.elapsed() < Duration::from_millis(TOAST_MS)
+        {
+            let (panel, pw, ph) = draw::label_panel(msg, 2);
+            let (x, y) = (dw.saturating_sub(pw) / 2, dh.saturating_sub(ph + 28));
             draw::blit(&mut buffer, dw, &panel, pw, ph, x, y);
         }
         let _ = buffer.present();
@@ -483,6 +556,7 @@ impl App {
                 }
                 self.request_redraw();
             }
+            Some(LocalAction::Capture) => self.capture_screenshot(),
             _ => {}
         }
         self.send_host_events(output.host);
@@ -508,7 +582,7 @@ impl App {
         };
         // Map the window point through the scaled, centred view; points in the black margin clamp
         // to the nearest framebuffer edge, as the Windows client's View::fb_point does.
-        let v = fit_view(sw, sh, size.width, size.height, self.scale_up);
+        let v = self.view_rect(size.width, size.height, sw, sh);
         if v.w <= 0 || v.h <= 0 {
             return (0, 0);
         }
@@ -543,13 +617,12 @@ impl App {
 
     fn on_mouse_move(&mut self, x: f64, y: f64) {
         self.cursor = (x, y);
-        let over_bar = self.fullscreen && y < bar::BAR_HEIGHT as f64;
-        if over_bar != self.bar_shown {
-            self.bar_shown = over_bar;
+        let over_bar = y >= 0.0 && y < bar::BAR_HEIGHT as f64;
+        if over_bar || self.bar_shown {
+            // Entering, leaving or moving within the strip: repaint to reveal, hover, or clear.
             self.request_redraw();
-        } else if over_bar {
-            self.request_redraw(); // refresh the hover highlight
         }
+        self.bar_shown = over_bar;
         if over_bar {
             return; // the toolbar strip does not drive the Mac cursor
         }
@@ -563,7 +636,8 @@ impl App {
             if pressed {
                 let dw = self.window.as_ref().map_or(0, |w| w.inner_size().width as usize);
                 match bar::bar_action_at(self.cursor, dw) {
-                    Some(bar::BarAction::Windowed) => self.toggle_fullscreen(),
+                    Some(bar::BarAction::Capture) => self.capture_screenshot(),
+                    Some(bar::BarAction::Fullscreen) => self.toggle_fullscreen(),
                     Some(bar::BarAction::Disconnect) => event_loop.exit(),
                     None => {}
                 }
@@ -691,15 +765,30 @@ impl ApplicationHandler<()> for App {
     /// While the stats readout is shown, wake on a timer so its rates keep updating even when the
     /// remote screen is idle (no frame arrives to trigger a redraw). Otherwise wait for events.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.meter.visible() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(400)));
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
+        let mut wake = self.meter.visible().then(|| Instant::now() + Duration::from_millis(400));
+        if let Some((_, shown)) = &self.toast {
+            let deadline = *shown + Duration::from_millis(TOAST_MS);
+            wake = Some(wake.map_or(deadline, |w| w.min(deadline)));
+        }
+        match wake {
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
     fn new_events(&mut self, _: &ActiveEventLoop, cause: StartCause) {
-        if matches!(cause, StartCause::ResumeTimeReached { .. }) && self.meter.visible() {
+        if !matches!(cause, StartCause::ResumeTimeReached { .. }) {
+            return;
+        }
+        // Expire the toast, then repaint if anything time-driven is on screen.
+        let mut redraw = self.meter.visible();
+        if let Some((_, shown)) = &self.toast {
+            redraw = true;
+            if shown.elapsed() >= Duration::from_millis(TOAST_MS) {
+                self.toast = None;
+            }
+        }
+        if redraw {
             self.request_redraw();
         }
     }
@@ -983,6 +1072,15 @@ fn write_png(framebuffer: &Framebuffer, path: &str) -> Result<(), String> {
     writer.write_image_data(&rgb).map_err(|e| e.to_string())
 }
 
+/// Copies an image (top-down RGBA) to the system clipboard via arboard.
+fn copy_image_to_clipboard(w: usize, h: usize, rgba: &[u8]) -> bool {
+    let image = arboard::ImageData { width: w, height: h, bytes: rgba.into() };
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => clipboard.set_image(image).is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Renders the overlay toolbar over a gradient (stand-in for the video) to a PNG, so the look can
 /// be checked without a display. Pure-local; no connection.
 fn bar_preview(path: &str) -> Result<(), String> {
@@ -993,7 +1091,7 @@ fn bar_preview(path: &str) -> Result<(), String> {
             buf[y * w + x] = (((x * 255 / w) as u32) << 16) | (((y * 255 / h) as u32) << 8) | 0x50;
         }
     }
-    bar::draw_bar(&mut buf, w, h, Some(bar::BarAction::Disconnect), "studio - Mac Studio");
+    bar::draw_bar(&mut buf, w, h, Some(bar::BarAction::Disconnect), "studio - Mac Studio", false);
 
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w as u32, h as u32);
