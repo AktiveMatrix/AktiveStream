@@ -101,6 +101,39 @@ pub(crate) fn update_request(incremental: bool, area: Rect) -> [u8; 10] {
     m
 }
 
+/// The high flag bit of a Fence message: this fence is a request and the receiver must echo it
+/// back with the bit cleared.
+pub(crate) const FENCE_REQUEST: u32 = 0x8000_0000;
+
+/// EnableContinuousUpdates (client message 150): ask the server to push FramebufferUpdates for
+/// `area` as the screen changes, with no FramebufferUpdateRequest per frame. Only sent after the
+/// server proves support by sending EndOfContinuousUpdates — an unsupporting server would treat
+/// this unknown message as a protocol error.
+pub(crate) fn enable_continuous_updates(enable: bool, area: Rect) -> [u8; 10] {
+    let mut m = [0u8; 10];
+    m[0] = 150;
+    m[1] = enable as u8;
+    m[2..4].copy_from_slice(&area.x.to_be_bytes());
+    m[4..6].copy_from_slice(&area.y.to_be_bytes());
+    m[6..8].copy_from_slice(&area.w.to_be_bytes());
+    m[8..10].copy_from_slice(&area.h.to_be_bytes());
+    m
+}
+
+/// Fence (message type 248, both directions): `{u8 type; 3 pad; u32 flags; u8 length; payload}`.
+/// The payload is at most 64 bytes. A fence carrying [`FENCE_REQUEST`] is echoed back with that
+/// flag cleared; this serializes an echo or an outgoing fence.
+pub(crate) fn fence(flags: u32, payload: &[u8]) -> Vec<u8> {
+    let len = payload.len().min(64);
+    let mut m = Vec::with_capacity(9 + len);
+    m.push(248);
+    m.extend_from_slice(&[0, 0, 0]); // padding
+    m.extend_from_slice(&flags.to_be_bytes());
+    m.push(len as u8);
+    m.extend_from_slice(&payload[..len]);
+    m
+}
+
 pub(crate) fn key_event(keysym: u32, down: bool) -> [u8; 8] {
     let mut m = [0u8; 8];
     m[0] = 4;
@@ -156,5 +189,21 @@ mod tests {
         assert_eq!(cut_text("hi"), [6, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
         // Characters beyond Latin-1 become '?'.
         assert_eq!(&cut_text("™")[8..], b"?");
+    }
+
+    #[test]
+    fn enable_continuous_updates_is_ten_bytes() {
+        let m = enable_continuous_updates(true, Rect { x: 0, y: 0, w: 1920, h: 1080 });
+        // enable=1, x=0, y=0, w=1920 (0x0780), h=1080 (0x0438), all big-endian.
+        assert_eq!(m, [150, 1, 0, 0, 0, 0, 0x07, 0x80, 0x04, 0x38]);
+    }
+
+    #[test]
+    fn fence_frames_flags_and_payload() {
+        assert_eq!(fence(FENCE_REQUEST, &[1, 2, 3]), [248, 0, 0, 0, 0x80, 0, 0, 0, 3, 1, 2, 3]);
+        // An echo clears the request bit and keeps the payload.
+        assert_eq!(fence(FENCE_REQUEST & !FENCE_REQUEST, &[9]), [248, 0, 0, 0, 0, 0, 0, 0, 1, 9]);
+        // Payload is capped at 64 bytes.
+        assert_eq!(fence(0, &[0u8; 100]).len(), 9 + 64);
     }
 }

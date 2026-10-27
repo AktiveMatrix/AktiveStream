@@ -255,6 +255,51 @@ fn apple_dh_session_end_to_end() {
 }
 
 #[test]
+fn continuous_updates_stop_per_frame_requests() {
+    use std::time::Duration;
+    let (port, server) = spawn(|mut s| {
+        assert!(handshake(&mut s, b"RFB 003.889\n", &[30, 2], "tester", "pw"));
+        server_init(&mut s, 64, 48); // consumes the setup messages and the first full request
+
+        // Advertise continuous-update support; the client must enable it for the whole screen.
+        s.write_all(&[150]).unwrap();
+        assert_eq!(rd::<10>(&mut s), [150, 1, 0, 0, 0, 0, 0, 64, 0, 48], "EnableContinuousUpdates full screen");
+
+        // Push an update the client never requested.
+        let px: Vec<u32> = (0..4).map(|i| 0x00AB_CD00 | i).collect();
+        let mut m = vec![0u8, 0];
+        m.extend_from_slice(&1u16.to_be_bytes());
+        rect_header(&mut m, 0, 0, 2, 2, 0);
+        m.extend_from_slice(&raw_bytes(&px));
+        s.write_all(&m).unwrap();
+
+        // In continuous mode the client must not send a FramebufferUpdateRequest back.
+        s.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        let mut b = [0u8; 1];
+        let r = s.read(&mut b);
+        assert!(
+            matches!(&r, Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut),
+            "expected no client request in continuous mode, got {r:?}"
+        );
+    });
+
+    let options = ConnectOptions::new("127.0.0.1", port, Some("tester".into()), "pw");
+    let (_info, mut reader, _writer) = connect(&options).unwrap();
+    let fb = Mutex::new(Framebuffer::default());
+    loop {
+        match reader.next_event(&fb) {
+            Ok(ServerEvent::Update { dirty }) => {
+                assert_eq!(dirty, vec![Rect { x: 0, y: 0, w: 2, h: 2 }]);
+                break;
+            }
+            Ok(_) => continue,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn apple_dh_wrong_password_reports_reason() {
     let (port, server) = spawn(|mut s| handshake(&mut s, b"RFB 003.889\n", &[30, 2], "tester", "right"));
     let options = ConnectOptions::new("127.0.0.1", port, Some("tester".into()), "wrong");

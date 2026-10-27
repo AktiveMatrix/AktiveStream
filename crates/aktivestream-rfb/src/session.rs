@@ -253,6 +253,7 @@ pub(crate) fn connect(options: &ConnectOptions) -> Result<(ServerInfo, SessionRe
         width,
         height,
         last_rect: options.encodings.contains(&Encoding::LastRect),
+        continuous_active: false,
         zrle: Inflater::new(),
         zlib: Inflater::new(),
         payload: Vec::new(),
@@ -298,6 +299,28 @@ impl SessionReader {
                     read_into(&mut self.input, &mut self.payload, len)?;
                     return Ok(ServerEvent::CutText(wire::latin1(&self.payload)));
                 }
+                150 => {
+                    // EndOfContinuousUpdates: the server supports the extension. Turn it on for the
+                    // whole screen so it pushes updates as they happen; `read_update` then stops
+                    // sending a request per frame (a keystroke's change no longer waits for one).
+                    if !self.continuous_active {
+                        let full = Rect { x: 0, y: 0, w: self.width, h: self.height };
+                        send(&self.out, &wire::enable_continuous_updates(true, full))?;
+                        self.continuous_active = true;
+                    }
+                }
+                248 => {
+                    // Fence: `3 pad, u32 flags, u8 length, payload`. A request must be echoed back
+                    // with the request bit cleared (the server's flow-control round-trip).
+                    let mut hdr = [0u8; 8];
+                    self.input.read_exact(&mut hdr)?;
+                    let flags = u32::from_be_bytes([hdr[3], hdr[4], hdr[5], hdr[6]]);
+                    read_into(&mut self.input, &mut self.payload, hdr[7] as usize)?;
+                    if flags & wire::FENCE_REQUEST != 0 {
+                        let echo = wire::fence(flags & !wire::FENCE_REQUEST, &self.payload);
+                        send(&self.out, &echo)?;
+                    }
+                }
                 other => return Err(Error::UnknownMessage(other)),
             }
         }
@@ -314,6 +337,7 @@ impl SessionReader {
         let mut ops = std::mem::take(&mut self.ops);
         ops.clear();
         let mut used = 0;
+        let mut resized = false;
         let mut i = 0u32;
         while until_last_rect || i < count as u32 {
             i += 1;
@@ -356,6 +380,7 @@ impl SessionReader {
                 e if e == Encoding::DesktopSize as i32 => {
                     self.width = r.w;
                     self.height = r.h;
+                    resized = true;
                     ops.push(Op::Resize(r.w, r.h));
                 }
                 e if e == Encoding::LastRect as i32 => break,
@@ -364,7 +389,15 @@ impl SessionReader {
         }
         self.stats.updates += 1;
         let full = Rect { x: 0, y: 0, w: self.width, h: self.height };
-        send(&self.out, &wire::update_request(true, full))?;
+        if self.continuous_active {
+            // The server pushes updates on its own; only re-arm the region after a resize so
+            // continuous updates keep covering the whole (newly sized) screen.
+            if resized {
+                send(&self.out, &wire::enable_continuous_updates(true, full))?;
+            }
+        } else {
+            send(&self.out, &wire::update_request(true, full))?;
+        }
 
         {
             let mut f = lock(fb);

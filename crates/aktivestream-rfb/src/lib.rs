@@ -58,11 +58,21 @@ pub enum Encoding {
     Cursor = -239,
     DesktopSize = -223,
     LastRect = -224,
+    /// Flow-control fence (TigerVNC). Advertising it lets the server send fences, which the
+    /// reader echoes; it also enables the server's continuous-update congestion control.
+    Fence = -312,
+    /// Server pushes FramebufferUpdates as the screen changes, without a request per frame
+    /// (TigerVNC). Removes the request round-trip so a keystroke's change is sent immediately
+    /// instead of waiting for the next pointer event to prompt a flush. Ignored by servers that
+    /// do not support it (e.g. Apple's), which keeps the request-driven path unchanged.
+    ContinuousUpdates = -313,
 }
 
 impl Encoding {
     /// Preference order sent in SetEncodings. Apple's server answers only ZRLE or Zlib in
-    /// compressed form, and falls back to Raw for everything else.
+    /// compressed form, and falls back to Raw for everything else. The two trailing
+    /// pseudo-encodings advertise support for the server-push extensions and are harmless to a
+    /// server that ignores them.
     pub const DEFAULT: &'static [Encoding] = &[
         Encoding::Zrle,
         Encoding::Zlib,
@@ -71,6 +81,8 @@ impl Encoding {
         Encoding::Cursor,
         Encoding::DesktopSize,
         Encoding::LastRect,
+        Encoding::Fence,
+        Encoding::ContinuousUpdates,
     ];
 }
 
@@ -236,9 +248,10 @@ pub struct ReaderStats {
 /// Reading half of a session. Owns the decoder state (persistent zlib streams).
 ///
 /// After each FramebufferUpdate the reader itself sends the next incremental
-/// FramebufferUpdateRequest, so the update pipeline never waits on the UI thread. Reader
-/// and [`SessionWriter`] share the socket's write half behind a mutex; every message is
-/// serialized first and written with one `write_all` under that lock.
+/// FramebufferUpdateRequest, so the update pipeline never waits on the UI thread — unless the
+/// server supports continuous updates, in which case it pushes updates on its own and the reader
+/// stops requesting. Reader and [`SessionWriter`] share the socket's write half behind a mutex;
+/// every message is serialized first and written with one `write_all` under that lock.
 pub struct SessionReader {
     input: BufReader<wire::CountingReader<session::ReadHalf>>,
     out: Arc<Mutex<session::WriteHalf>>,
@@ -247,6 +260,9 @@ pub struct SessionReader {
     height: u16,
     /// LastRect was requested, so a rect count of 0xFFFF means "until LastRect".
     last_rect: bool,
+    /// The server proved it supports continuous updates (it sent EndOfContinuousUpdates) and we
+    /// enabled them, so it now pushes updates and the reader stops requesting one per frame.
+    continuous_active: bool,
     zrle: decode::Inflater,
     zlib: decode::Inflater,
     payload: Vec<u8>,
