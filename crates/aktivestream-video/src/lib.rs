@@ -82,6 +82,15 @@ impl Decoder {
                 .or_else(|| enumerate(&info, MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER))
                 .ok_or(Error::NoDecoder(codec.name()))?;
 
+            // Low-latency mode: emit each frame as soon as it decodes, 1-in-1-out. Without it a
+            // hardware decoder keeps a pipeline of frames and returns NEED_MORE_INPUT until the
+            // NEXT access unit arrives, so a lone keystroke's frame is stuck in the decoder until
+            // more frames come (e.g. when the mouse moves) — the screen looks frozen while typing.
+            // Set before streaming begins; ignore it if the decoder's attribute store is absent.
+            if let Ok(attrs) = transform.GetAttributes() {
+                let _ = attrs.SetUINT32(&MF_LOW_LATENCY, 1);
+            }
+
             let input = MFCreateMediaType()?;
             input.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
             input.SetGUID(&MF_MT_SUBTYPE, &codec.subtype())?;
