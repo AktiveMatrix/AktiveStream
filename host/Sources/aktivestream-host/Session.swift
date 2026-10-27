@@ -155,12 +155,38 @@ func sendVideoStart(_ connection: NWConnection, _ w: Int, _ h: Int) async throws
     try await writeMessage(connection, kind: MsgKind.videoStart, body: start.data)
 }
 
-/// Drains the encoder's queued frames to the client.
-func flushFrames(_ queue: FrameQueue, _ connection: NWConnection) async throws {
+/// Bounds how many encoded frames may be in flight (queued + sending) at once. Encoded HEVC
+/// frames are P-frames that reference their predecessor, so none can be dropped after encoding
+/// without breaking the decode chain; the only safe place to shed load is BEFORE encoding. When
+/// the link can't keep up, the capture callback drops the frame it is holding instead of letting
+/// the queue and the QUIC send buffer grow — otherwise the client keeps decoding ever-staler
+/// frames and the picture trails behind (visible "cueing up" during motion). A small budget keeps
+/// latency low while still pipelining one send against the next capture.
+final class FrameBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inFlight = 0
+    private let max: Int
+    init(max: Int) { self.max = max }
+    /// Reserves a slot for a frame about to be encoded; false means "too far behind, drop it".
+    func acquire() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if inFlight >= max { return false }
+        inFlight += 1
+        return true
+    }
+    /// Frees a slot once a frame has been sent (or failed to encode).
+    func release() {
+        lock.lock(); inFlight = Swift.max(0, inFlight - 1); lock.unlock()
+    }
+}
+
+/// Drains the encoder's queued frames to the client, freeing a budget slot per frame sent.
+func flushFrames(_ queue: FrameQueue, _ connection: NWConnection, _ budget: FrameBudget) async throws {
     for frame in queue.drain() {
         var body = Body()
         body.u8(frame.isKeyframe ? 1 : 0)
         body.data.append(frame.data)
+        defer { budget.release() }
         try await writeMessage(connection, kind: MsgKind.videoFrame, body: body.data)
     }
 }
@@ -188,15 +214,20 @@ func streamVideo(_ connection: NWConnection, _ control: StreamControl) async thr
         streamLoop: while true {
             try await sendVideoStart(connection, w, h)
             let queue = FrameQueue()
+            let budget = FrameBudget(max: 2)
             let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
             let capture = ScreenCapture(width: w, height: h) { pixelBuffer, ptsNanos in
-                try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
+                // Drop this frame if the link is already behind (see FrameBudget): dropping an
+                // unencoded capture is safe; dropping an encoded P-frame would corrupt the stream.
+                guard budget.acquire() else { return }
+                do { try encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false) }
+                catch { budget.release() }
             }
             try await capture.start(display: currentDisplay)
             var restart = false
             do {
                 while true {
-                    try await flushFrames(queue, connection)
+                    try await flushFrames(queue, connection, budget)
                     // A pending client resolution request: switch to the nearest advertised mode.
                     if let (rw, rh) = control.take(),
                         let mode = DisplayModes.nearest(display, rw, rh),
@@ -231,14 +262,17 @@ func streamVideo(_ connection: NWConnection, _ control: StreamControl) async thr
         log("session: streaming the main display via framebuffer capture")
         try await sendVideoStart(connection, w, h)
         let queue = FrameQueue()
+        let budget = FrameBudget(max: 2)
         let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
         let capture = FramebufferCapture(displayID: display, width: w, height: h, fps: 30) { pixelBuffer, ptsNanos in
-            try? encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false)
+            guard budget.acquire() else { return }
+            do { try encoder.encode(pixelBuffer, ptsNanos: ptsNanos, forceKeyframe: false) }
+            catch { budget.release() }
         }
         capture.begin()
         do {
             while true {
-                try await flushFrames(queue, connection)
+                try await flushFrames(queue, connection, budget)
                 try await Task.sleep(nanoseconds: 5_000_000)
             }
         } catch {
@@ -251,14 +285,16 @@ func streamVideo(_ connection: NWConnection, _ control: StreamControl) async thr
         log("session: no capturable display; streaming synthetic frames")
         try await sendVideoStart(connection, w, h)
         let queue = FrameQueue()
+        let budget = FrameBudget(max: Int.max) // synthetic: a fixed count, never drop
         let encoder = try HEVCEncoder(width: w, height: h, fps: fps, bitrate: 20_000_000) { queue.append($0) }
         for i in 0..<streamFrameCount {
             guard let pb = syntheticPixelBuffer(width: w, height: h, tick: i) else { continue }
+            _ = budget.acquire()
             try encoder.encode(pb, ptsNanos: UInt64(i) * UInt64(1_000_000_000 / fps), forceKeyframe: i == 0)
-            try await flushFrames(queue, connection)
+            try await flushFrames(queue, connection, budget)
         }
         encoder.finish()
-        try await flushFrames(queue, connection)
+        try await flushFrames(queue, connection, budget)
         try await closeStream(connection)
         log("session: streamed \(streamFrameCount) synthetic frames")
     }
