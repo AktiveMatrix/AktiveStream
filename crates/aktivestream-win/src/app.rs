@@ -548,6 +548,20 @@ impl App {
         self.cursor.as_ref().map(|c| c.0)
     }
 
+    /// Whether a client-area point sits over the live remote video (where the native host draws the
+    /// remote cursor into the frame) rather than over the client's own chrome — the toolbar strip or
+    /// the letterbox margins. Native hides the local cursor only over the video, so the pointer stays
+    /// visible for the toolbar controls and off to the sides.
+    fn point_over_remote(&self, x: i32, y: i32) -> bool {
+        // The top strip is the toolbar's territory (a persistent strip in windowed mode, reveal-on-
+        // hover in full screen), so always keep the pointer visible there.
+        if (0..bar::BAR_HEIGHT as i32).contains(&y) {
+            return false;
+        }
+        let v = self.view;
+        (v.x..v.x + v.w).contains(&x) && (v.y..v.y + v.h).contains(&y)
+    }
+
     /// Whether the toolbar should be shown now: always in windowed mode (a persistent strip above
     /// the remote view); in full screen only while the pointer is at the top edge.
     fn bar_visible(&self) -> bool {
@@ -1145,8 +1159,9 @@ fn on_paint(hwnd: HWND) {
     }
 }
 
-/// When true, the client hides the local cursor over its client area (the native path renders the
-/// remote cursor into the video, so a local cursor would double it). Set in `run_window`.
+/// When true, the client hides the local cursor over the live remote video (the native path renders
+/// the remote cursor into the video, so a local cursor would double it), while keeping a normal
+/// arrow over the toolbar and letterbox margins — see `point_over_remote`. Set in `run_window`.
 static HIDE_CURSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -1201,7 +1216,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, wparam: WPARAM, lpar
         }
         WM_SETCURSOR if (lparam.0 & 0xffff) as u32 == HTCLIENT => {
             if HIDE_CURSOR.load(std::sync::atomic::Ordering::Relaxed) {
-                unsafe { SetCursor(None) };
+                // Native draws the remote cursor into the video, so hide the local one only over the
+                // live video; over the toolbar and the letterbox margins keep a normal arrow so the
+                // controls stay usable. WM_SETCURSOR precedes the matching WM_MOUSEMOVE, so read the
+                // live pointer position rather than the (stale) cached one.
+                let over_remote = unsafe {
+                    let mut p = POINT::default();
+                    GetCursorPos(&mut p).is_ok()
+                        && ScreenToClient(hwnd, &mut p).as_bool()
+                        && with_app(|app| app.point_over_remote(p.x, p.y)) == Some(true)
+                };
+                unsafe {
+                    SetCursor(if over_remote { None } else { Some(LoadCursorW(None, IDC_ARROW).unwrap_or_default()) });
+                }
                 return LRESULT(1);
             }
             if let Some(Some(handle)) = with_app(|app| app.cursor_handle()) {
